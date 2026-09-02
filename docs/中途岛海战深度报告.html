@@ -1,0 +1,424 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>深度报告：美国为何能赢得中途岛海战</title>
+<style>
+  :root {
+    --bg: #0d1420;
+    --panel: #16202f;
+    --panel2: #1b2838;
+    --ink: #e8edf4;
+    --muted: #9fb0c3;
+    --accent: #e8b93d;
+    --accent2: #5aa7de;
+    --red: #d9534f;
+    --green: #4caf7d;
+    --line: #2b3a4e;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: var(--bg);
+    color: var(--ink);
+    font-family: "Microsoft YaHei", "PingFang SC", "Segoe UI", sans-serif;
+    line-height: 1.8;
+  }
+  .wrap { max-width: 960px; margin: 0 auto; padding: 0 24px 80px; }
+
+  /* ===== 头部 ===== */
+  header {
+    background: linear-gradient(180deg, #10233c 0%, #0d1420 100%);
+    border-bottom: 3px solid var(--accent);
+    padding: 64px 24px 48px;
+    text-align: center;
+  }
+  header .kicker {
+    color: var(--accent);
+    letter-spacing: 6px;
+    font-size: 14px;
+    text-transform: uppercase;
+    margin-bottom: 16px;
+  }
+  header h1 {
+    font-size: 40px;
+    font-weight: 800;
+    margin-bottom: 12px;
+  }
+  header .sub {
+    color: var(--muted);
+    font-size: 17px;
+    max-width: 720px;
+    margin: 0 auto;
+  }
+  .meta-row {
+    display: flex;
+    justify-content: center;
+    gap: 32px;
+    margin-top: 28px;
+    flex-wrap: wrap;
+    color: var(--muted);
+    font-size: 14px;
+  }
+  .meta-row span b { color: var(--ink); }
+
+  /* ===== 核心数据卡片 ===== */
+  .stats {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 16px;
+    margin: 40px 0;
+  }
+  .stat {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 20px;
+    text-align: center;
+  }
+  .stat .num { font-size: 30px; font-weight: 800; color: var(--accent); }
+  .stat .label { color: var(--muted); font-size: 13px; margin-top: 4px; }
+  .stat.jp .num { color: var(--red); }
+  .stat.us .num { color: var(--accent2); }
+
+  h2 {
+    font-size: 26px;
+    margin: 56px 0 8px;
+    padding-left: 14px;
+    border-left: 5px solid var(--accent);
+  }
+  h2 .en { color: var(--muted); font-size: 15px; font-weight: 400; margin-left: 10px; }
+  h3 { font-size: 19px; margin: 28px 0 10px; color: var(--accent2); }
+  p { margin: 12px 0; color: #cfd9e6; }
+  .lead { font-size: 17px; color: var(--muted); margin-bottom: 20px; }
+
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    padding: 26px 28px;
+    margin: 20px 0;
+  }
+  .callout {
+    border-left: 4px solid var(--accent);
+    background: var(--panel2);
+    padding: 16px 20px;
+    border-radius: 0 8px 8px 0;
+    margin: 20px 0;
+    font-size: 15px;
+  }
+  .callout.red { border-color: var(--red); }
+  .callout.green { border-color: var(--green); }
+  .callout b.tag { color: var(--accent); }
+  .callout.red b.tag { color: var(--red); }
+  .callout.green b.tag { color: var(--green); }
+
+  /* ===== 时间线 ===== */
+  .timeline { position: relative; margin: 30px 0; padding-left: 30px; }
+  .timeline::before {
+    content: "";
+    position: absolute; left: 8px; top: 0; bottom: 0;
+    width: 2px; background: var(--line);
+  }
+  .tl-item { position: relative; margin-bottom: 26px; }
+  .tl-item::before {
+    content: "";
+    position: absolute; left: -28px; top: 8px;
+    width: 12px; height: 12px; border-radius: 50%;
+    background: var(--accent2);
+    box-shadow: 0 0 0 4px rgba(90,167,222,.15);
+  }
+  .tl-item.key::before { background: var(--accent); box-shadow: 0 0 0 4px rgba(232,185,61,.2); }
+  .tl-time { color: var(--accent); font-weight: 700; font-size: 14px; letter-spacing: 1px; }
+  .tl-title { font-weight: 700; font-size: 16px; margin: 2px 0; }
+  .tl-desc { color: var(--muted); font-size: 14px; }
+
+  /* ===== 对比表 ===== */
+  table { width: 100%; border-collapse: collapse; margin: 20px 0; font-size: 14px; }
+  th, td { padding: 12px 14px; text-align: left; border-bottom: 1px solid var(--line); }
+  th { background: var(--panel2); color: var(--accent); font-size: 13px; letter-spacing: 1px; }
+  tr:hover td { background: rgba(255,255,255,.02); }
+  .jp-col { color: #f0a5a3; }
+  .us-col { color: #a8cdec; }
+
+  /* ===== 关键因素权重条 ===== */
+  .factor { margin: 18px 0; }
+  .factor .f-head { display: flex; justify-content: space-between; font-size: 15px; margin-bottom: 6px; }
+  .factor .f-head b { color: var(--ink); }
+  .factor .f-head span { color: var(--muted); font-size: 13px; }
+  .bar { height: 10px; background: var(--panel2); border-radius: 5px; overflow: hidden; }
+  .bar i { display: block; height: 100%; border-radius: 5px;
+    background: linear-gradient(90deg, var(--accent2), var(--accent)); }
+
+  .footnote { color: var(--muted); font-size: 13px; border-top: 1px solid var(--line); margin-top: 60px; padding-top: 20px; }
+  footer { text-align: center; color: #5a6b7f; font-size: 13px; padding: 30px; }
+
+  /* ===== 反事实模块 ===== */
+  .counterfactual { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 700px) { .counterfactual { grid-template-columns: 1fr; } header h1 { font-size: 30px; } }
+  .cf-box { background: var(--panel2); border-radius: 10px; padding: 18px 20px; border: 1px solid var(--line); }
+  .cf-box h4 { font-size: 15px; margin-bottom: 8px; color: var(--accent); }
+  .cf-box p { font-size: 14px; margin: 6px 0; }
+
+  .quote { font-style: italic; color: var(--muted); text-align: center; margin: 30px auto; max-width: 640px; }
+  .quote .who { display: block; font-style: normal; font-size: 13px; margin-top: 8px; color: #5a6b7f; }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="kicker">Deep Analysis Report · 深度战史分析</div>
+  <h1>命运的五分钟之外：<br>美国凭什么赢得中途岛海战？</h1>
+  <p class="sub">1942年6月4日—7日，美日两国海军在中太平洋爆发了一场改变二战走向的航母决战。
+  日本联合舰队在纸面实力占优的情况下惨败，损失四艘主力航母。本报告从情报、指挥、战术、工业与偶然性五个层面，拆解这场以弱胜强的真正原因。</p>
+  <div class="meta-row">
+    <span>战役时间：<b>1942.6.4 – 6.7</b></span>
+    <span>地点：<b>中途岛海域（阿留申以南）</b></span>
+    <span>性质：<b>太平洋战争转折点</b></span>
+  </div>
+</header>
+
+<div class="wrap">
+
+  <!-- 战损对比 -->
+  <div class="stats">
+    <div class="stat jp"><div class="num">4 艘</div><div class="label">日本损失舰队航母（赤城·加贺·苍龙·飞龙）</div></div>
+    <div class="stat jp"><div class="num">~332 架</div><div class="label">日本损失舰载机（含随舰飞行员）</div></div>
+    <div class="stat jp"><div class="num">3,057 人</div><div class="label">日本阵亡（含大量精英飞行员与整备人员）</div></div>
+    <div class="stat us"><div class="num">1 艘</div><div class="label">美国损失航母（约克城号，含此前珊瑚海战伤修复）</div></div>
+    <div class="stat us"><div class="num">~150 架</div><div class="label">美国损失飞机</div></div>
+    <div class="stat us"><div class="num">307 人</div><div class="label">美国阵亡</div></div>
+  </div>
+
+  <div class="callout">
+    <b class="tag">一句话结论：</b>美国获胜不是靠"命运的五分钟"式的运气，而是<b>情报破译带来的战场单向透明</b>，
+    叠加尼米兹的正确部署、日军自身的计划缺陷，以及俯冲轰炸机部队在巨大牺牲下恰好制造出的致命时间窗口。
+    运气只是放大器，不是原因。
+  </div>
+
+  <!-- ================= 一、情报 ================= -->
+  <h2>一、最根本的关键：密码破译带来的单向透明 <span class="en">Intelligence & HYPO</span></h2>
+  <p class="lead">如果只能保留一个获胜原因，那就是这一个。美军知道日军要去哪里、什么时候去、以什么编成去。</p>
+
+  <div class="card">
+    <h3>1. JN-25 密码与 "AF" 陷阱</h3>
+    <p>珍珠港事件后，夏威夷情报站（代号 HYPO，负责人约瑟夫·罗彻福特少校）持续破译日本海军的 JN-25 密码。
+    1942年5月，破译电文中频繁出现目标代号 "<b>AF</b>"。华盛顿情报部门认为 AF 是阿留申或美国西海岸，
+    而罗彻福特坚持认为 <b>AF = 中途岛</b>。</p>
+    <p>尼米兹批准了一个大胆验证：让中途岛守军用明码发出"<b>岛上淡水蒸馏装置故障、淡水短缺</b>"的假电报。
+    两天后，美军截获日军密电："AF 可能缺乏淡水。"<b>AF 的身份就此钉死为中途岛</b>，
+    连日军的进攻日期（6月4日前后）和编成也被大致破译。</p>
+    <div class="callout green">
+      <b class="tag">战略意义：</b>这等于把山本五十六精心准备的"诱敌伏击"剧本提前交给了美方导演。
+      日本计划的核心是"攻其不备、以逸待劳"，而情报泄露恰恰让"不备"与"待劳"同时失效。
+    </div>
+
+    <h3>2. 单向透明的连锁效应</h3>
+    <p>因为知道了时间和地点，尼米兹得以做出三个正常情况下不敢做的决定：</p>
+    <p>① 把仅有且更弱的三艘航母（企业号、大黄蜂号、紧急抢修的约克城号）<b>主动前出到中途岛东北方的伏击阵位</b>（"幸运角"），从被猎杀者变成猎杀者；<br>
+    ② 在中途岛本身集结了约 120 架各型飞机和守备部队，把环礁变成"不沉的航母"；<br>
+    ③ 不为阿留申方向的佯攻分兵——日军佯动彻底落空。</p>
+  </div>
+
+  <!-- ================= 二、指挥 ================= -->
+  <h2>二、尼米兹的指挥艺术：敢赌、会用人 <span class="en">Nimitz's Command</span></h2>
+  <div class="card">
+    <h3>1. 敢于以弱设伏</h3>
+    <p>美军参战航母 3 艘对日军机动部队 4 艘主力航母（外加山本本队的支援力量），舰载机数量、飞行员素质均处下风。
+    常规做法是避战保船。尼米兹却依据情报判断，将航母隐蔽部署在中途岛东北约 350 海里处，
+    抢在日军发现之前先敌出击。<b>这是把情报优势兑现为战术主动的关键一步。</b></p>
+
+    <h3>2. 72小时抢修约克城号</h3>
+    <p>约克城号在珊瑚海海战中重伤，军方评估需回本土大修 90 天。珍珠港船厂在尼米兹亲自督工下
+    <b>仅用约 3 天完成应急抢修</b>就将其投入战场。正是这艘"不该出现在这里"的航母，
+    在6月4日投下了压垮日军的第三波俯冲轰炸力量。日军战前判断"美军最多只有一两艘航母"，
+    情报与工程的双重欺骗使其兵力估算从一开始就错了。</p>
+
+    <h3>3. 对比：山本的复杂计划与指挥割裂</h3>
+    <p>山本的 MI 作战计划庞大而分散：主力舰队、机动部队、中途岛登陆部队、阿留申佯攻部队相隔数百海里，
+    彼此无法及时支援。更致命的是，远在数百海里外的大和号战列舰上的山本，
+    与前线机动部队指挥官南云忠一之间存在严重的 <b>信息延迟与指挥脱节</b>。
+    当南云陷入困境时，庞大的联合舰队主力根本帮不上任何忙。</p>
+  </div>
+
+  <!-- ================= 三、日军的结构性失误 ================= -->
+  <h2>三、日军的结构性失误：败因有相当部分在日本自己 <span class="en">Japanese Failures</span></h2>
+  <div class="card">
+    <table>
+      <tr><th style="width:22%">失误维度</th><th>具体表现</th><th style="width:32%">后果</th></tr>
+      <tr>
+        <td><b>侦察搜索薄弱</b></td>
+        <td class="jp-col">南云仅以 7 架水上飞机做单程扇面搜索，利根号 4 号侦察机还因弹射器故障延迟约 30 分钟起飞</td>
+        <td>直到美机已起飞近两小时，才发现美军舰队，彻底丧失预警时间</td>
+      </tr>
+      <tr>
+        <td><b>"换弹作业"两难</b></td>
+        <td class="jp-col">南云先令鱼雷机换装对地炸弹，发现美舰后又下令换回鱼雷，机库内堆满弹药与油料管线</td>
+        <td>航母机库变成充满炸弹、鱼雷与未固定油料的火药桶，被命中后连环殉爆</td>
+      </tr>
+      <tr>
+        <td><b>战斗机运用僵化</b></td>
+        <td class="jp-col">零战直卫全部扑向低空拦截鱼雷机，中高空门户洞开，且缺乏雷达与统一引导</td>
+        <td>为俯冲轰炸机留出了无人拦截的致命高度层</td>
+      </tr>
+      <tr>
+        <td><b>损管与编队思想</b></td>
+        <td class="jp-col">日军重视攻击、轻视损管，灭火设备与训练不足；南云在旗舰起火后仓促转移指挥</td>
+        <td>中弹一两枚即不可挽救；反击组织迟缓混乱</td>
+      </tr>
+      <tr>
+        <td><b>情报傲慢</b></td>
+        <td class="jp-col">假定美军毫无察觉，潜艇警戒线部署迟到了美军已经就位之后</td>
+        <td>"奇袭"的前提不存在，整个计划从第一天起就已破产</td>
+      </tr>
+    </table>
+    <div class="callout red">
+      <b class="tag">要点：</b>美军赢得并不"轻松"，但日军每一处结构性缺陷都在放大美军每一次打击的效果。
+      胜利 = 美军做对了关键几件事 × 日军在几乎所有环节都犯了错。
+    </div>
+  </div>
+
+  <!-- ================= 四、致命的20分钟 ================= -->
+  <h2>四、战术执行：牺牲换来的"致命二十分钟" <span class="en">The Fatal 20 Minutes</span></h2>
+  <p class="lead">6月4日上午的战场时序，是理解"胜利如何发生"的核心。</p>
+
+  <div class="timeline">
+    <div class="tl-item">
+      <div class="tl-time">04:30</div>
+      <div class="tl-title">南云第一波 108 架空袭中途岛</div>
+      <div class="tl-desc">岛上美军早有准备，战机升空、高炮就位，日军战果远低于预期；南云还收到"建议二次攻击"的报告。</div>
+    </div>
+    <div class="tl-item">
+      <div class="tl-time">07:15 前后</div>
+      <div class="tl-title">换弹命令下达又收回</div>
+      <div class="tl-desc">为准备第二次对岛攻击，鱼雷机被换装陆用炸弹；随后侦察机发现"疑似美舰"，命令反转，机库陷入混乱。</div>
+    </div>
+    <div class="tl-item">
+      <div class="tl-time">09:20 – 10:20</div>
+      <div class="tl-title">鱼雷机部队的自杀式冲锋</div>
+      <div class="tl-desc">大黄蜂号、企业号、约克城号的三个鱼雷机中队以及中途岛起飞的陆基飞机，在无战斗机掩护下轮番冲击。
+      35 架 TBD 毁灭者鱼雷机中仅 6 架返航，无一命中——<b>但它们把日军零战全部拖到了低空，并打乱了南云的起飞节奏</b>。</div>
+    </div>
+    <div class="tl-item key">
+      <div class="tl-time">10:22 – 10:26</div>
+      <div class="tl-title">"致命时刻"：俯冲轰炸机同时抵达</div>
+      <div class="tl-desc">斯普鲁恩斯的企业号 SBD 无畏式俯冲轰炸机群（麦克拉斯基少校率领）与约克城号的机群恰在此时到达战场上空。
+      日军战斗机在低空、甲板上堆着加满油挂好弹的攻击机群——<b>三分钟之内，加贺、赤城、苍龙三艘航母接连中弹起火</b>。</div>
+    </div>
+    <div class="tl-item">
+      <div class="tl-time">12:20</div>
+      <div class="tl-title">飞龙号的反击</div>
+      <div class="tl-desc">山口多闻少将指挥唯一完好的飞龙号两度出击，重创并最终击沉约克城号。但飞龙也在傍晚被美军侦察机发现、炸毁，6月5日凌晨自沉。</div>
+    </div>
+    <div class="tl-item key">
+      <div class="tl-time">6月5日凌晨</div>
+      <div class="tl-title">山本取消 MI 作战，全线撤退</div>
+      <div class="tl-desc">日本联合舰队自开战以来首次战略退却。太平洋攻守之势，自此逆转。</div>
+    </div>
+  </div>
+
+  <div class="quote">
+    "据我所知，中途岛战役中没有人下达过导致三艘敌航母沉没的那次攻击的命令。那是无数错误、运气与个人英勇的总和。"
+    <span class="who">—— 后人对该战"无计划的完美"的经典概括（源自对多位参战者回忆的归纳）</span>
+  </div>
+
+  <div class="card">
+    <h3>如何评价斯普鲁恩斯与弗莱彻？</h3>
+    <p><b>弗莱彻</b>（战术总指挥，约克城号）按情报把舰队带到了正确的位置，并在上午果断释放了全部攻击力量。<br>
+    <b>斯普鲁恩斯</b>（16 特混舰队指挥）的争议与功绩并存：大黄蜂号机群组织混乱、协同尽失，鱼雷机中队几乎被全歼；
+    但正是他冒险前出、提前发起攻击的决心，让南云始终处于"发现美机→换弹→再发现→再换弹"的被动循环中。
+    <b>协同的失败反而造成了日军防御的错位</b>——这是中途岛最诡异的辩证法：一场"各自为战的烂仗"，恰好撞上了对手最脆弱的时间窗口。</p>
+  </div>
+
+  <!-- ================= 五、深层因素 ================= -->
+  <h2>五、更深层的胜负手：工业与人的再生产 <span class="en">The Deeper War</span></h2>
+  <div class="card">
+    <h3>1. 精英飞行员的"不可再生"</h3>
+    <p>日本损失的不仅是四艘航母，更是 2,500 余名舰载机人员中的精华——开战以来横扫太平洋的老练飞行员与整备团队。
+    日本的培训体系无法快速补充，中途岛之后日本海军航空兵的战斗力曲线开始不可逆地下滑。
+    反观美国，完善的轮换与培训制度让飞行员越打越多。</p>
+    <h3>2. 工业产能的时间压力</h3>
+    <p>1942 年，美国埃塞克斯级航母正以惊人的速度下水。山本深知：<b>再拖一年，数量差距将无法弥补</b>。
+    这正是日本急于寻求决战的心理根源，也是其计划充满赌博性的原因——而急于求成的赌博，最容易被冷静的对手反噬。</p>
+    <h3>3. 美国的容错空间</h3>
+    <p>约克城号沉了可以接受，因为新航母源源不断；日本沉一艘少一艘。中途岛本质上是
+    "<b>高容错一方</b>击败了"<b>零容错一方</b>"的一次豪赌。</p>
+  </div>
+
+  <!-- ================= 六、运气占多少？ ================= -->
+  <h2>六、运气占多少？——关键因素权重评估 <span class="en">Luck vs. Skill</span></h2>
+  <div class="card">
+    <div class="factor">
+      <div class="f-head"><b>情报破译（HYPO 破译 JN-25、AF 陷阱）</b><span>约 35%</span></div>
+      <div class="bar"><i style="width:35%"></i></div>
+    </div>
+    <div class="factor">
+      <div class="f-head"><b>尼米兹的正确部署与决策（伏击阵位、抢修约克城）</b><span>约 20%</span></div>
+      <div class="bar"><i style="width:20%"></i></div>
+    </div>
+    <div class="factor">
+      <div class="f-head"><b>日军自身失误（侦察薄弱、换弹混乱、指挥割裂）</b><span>约 25%</span></div>
+      <div class="bar"><i style="width:25%"></i></div>
+    </div>
+    <div class="factor">
+      <div class="f-head"><b>俯冲轰炸机/鱼雷机部队的战术执行与牺牲</b><span>约 12%</span></div>
+      <div class="bar"><i style="width:12%"></i></div>
+    </div>
+    <div class="factor">
+      <div class="f-head"><b>纯粹的运气（各波次"恰好"同时抵达、侦察机故障等）</b><span>约 8%</span></div>
+      <div class="bar"><i style="width:8%"></i></div>
+    </div>
+    <p style="font-size:13px;color:var(--muted);margin-top:14px;">
+    * 权重为基于史料综合的定性评估，用于表达各因素的相对贡献，非精确统计。</p>
+  </div>
+
+  <!-- ================= 七、反事实推演 ================= -->
+  <h2>七、反事实推演：如果……会怎样？ <span class="en">Counterfactuals</span></h2>
+  <div class="counterfactual">
+    <div class="cf-box">
+      <h4>若日军未换密码本 / AF 陷阱失败</h4>
+      <p>美军将在错误方向布防，日本大概率攻占中途岛，夏威夷前沿暴露，太平洋战争至少延长一年。</p>
+    </div>
+    <div class="cf-box">
+      <h4>若利根 4 号侦察机准时起飞</h4>
+      <p>南云可提前约半小时发现美舰，攻击机群可能在美军机群到达前起飞，三艘航母的命运或可改写。</p>
+    </div>
+    <div class="cf-box">
+      <h4>若南云坚持先回收飞机再攻击</h4>
+      <p>美军第一波打击仍将命中正在回收作业的航母，日军的损失只会更大而非更小——被动就是原罪。</p>
+    </div>
+    <div class="cf-box">
+      <h4>若美军输掉中途岛</h4>
+      <p>日本获得对夏威夷的空中威胁能力，澳大利亚补给线压力剧增；但美国工业全开后的长期胜负不会改变，改变的只是代价与时长。</p>
+    </div>
+  </div>
+
+  <!-- ================= 结语 ================= -->
+  <h2>结语：中途岛到底教会我们什么？<span class="en">Conclusion</span></h2>
+  <div class="card">
+    <p><b>第一，信息优势是最大的不对称。</b>在实力不如对手时，"知道对手要干什么"可以抹平甚至逆转力量差距。
+    中途岛是情报决定战争结局的教科书级案例。</p>
+    <p><b>第二，复杂精密的计划往往是脆弱的计划。</b>山本的计划需要每一路都按分秒配合，而战争从不配合计划；
+    尼米兹的方案简单、有弹性、留有余地，反而更抗意外。</p>
+    <p><b>第三，胜利常以"混乱"的形式降临。</b>美军当天上午的空中攻击毫无协同可言，
+    但正是这种混乱把日军的防御体系撕成了碎片。真正的本事不是设计完美剧本，
+    而是当剧本崩坏时，仍能保持目标感和攻击意志。</p>
+    <p><b>第四，决定战争的是"可再生的能力"。</b>飞行员培训、造船产能、损管体系、密码人才——
+    这些平时看不见的能力，才是胜负的终极砝码。日本输掉的不是一场战役，而是自己押上了全部、对手却远未到极限的赌局。</p>
+    <div class="callout">
+      <b class="tag">终极答案：</b>美国能赢，是因为它把"情报优势"这一张牌，
+      通过正确的战略部署、顽强的战术执行和对手的连环失误，
+      在二十分钟内兑现成了四艘燃烧的航母。<b>运气敲了门，但开门的是人。</b>
+    </div>
+  </div>
+
+  <div class="footnote">
+    <b>主要参考资料：</b>渊田美津雄、奥宫正武《中途岛海战》；Jonathan Parshall &amp; Anthony Tully, <i>Shattered Sword: The Untold Story of the Battle of Midway</i>（2005）；
+    Walter Lord, <i>Incredible Victory</i>（1967）；Craig Symonds, <i>The Battle of Midway</i>（2011）；美国海军官方战史 (Morison, <i>History of United States Naval Operations in World War II</i>, Vol. IV)。
+    <br>注：本报告中具体伤亡数字因史料口径不同略有出入，采用通行估计值。
+  </div>
+</div>
+
+<footer>深度历史分析报告 · 生成于 2026 年 · 仅供学习与研究参考</footer>
+</body>
+</html>

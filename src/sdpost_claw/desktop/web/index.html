@@ -1,0 +1,317 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>sdpost-claw</title>
+    <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+    <div class="app">
+        <!-- ===================== Sidebar ===================== -->
+        <aside class="sidebar">
+            <div class="sidebar-header">
+                <div class="brand">
+                    <div class="brand-logo">
+                        <svg width="28" height="28" viewBox="0 0 28 28" fill="none">
+                            <rect x="2" y="2" width="24" height="24" rx="6" stroke="#bef264" stroke-width="2"/>
+                            <path d="M8 14h12M14 8v12" stroke="#bef264" stroke-width="2" stroke-linecap="round"/>
+                            <circle cx="14" cy="14" r="3" fill="#bef264"/>
+                        </svg>
+                    </div>
+                    <div class="brand-text">
+                        <span class="brand-name">sdpost-claw</span>
+                        <span class="brand-version">v0.1.0</span>
+                    </div>
+                </div>
+            </div>
+
+            <nav class="sidebar-nav" id="sidebarNav">
+                <button class="nav-item active" data-view="chat" data-key="newtask">
+                    <span class="nav-icon">
+                        <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+                            <path d="M8 2v12M2 8h12" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+                        </svg>
+                    </span>
+                    <span class="nav-label">新任务</span>
+                </button>
+                <button class="nav-item" data-view="chat" data-key="agent">
+                    <span class="nav-icon">
+                        <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+                            <circle cx="8" cy="5" r="3" stroke="currentColor" stroke-width="1.5"/>
+                            <path d="M3 14c0-2.8 2.2-5 5-5s5 2.2 5 5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+                        </svg>
+                    </span>
+                    <span class="nav-label">智能体</span>
+                </button>
+                <button class="nav-item" data-view="list" data-key="projects">
+                    <span class="nav-icon">
+                        <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+                            <path d="M2 4l6-2 6 2v8l-6 2-6-2V4z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/>
+                            <path d="M2 4l6 2 6-2M8 6v8" stroke="currentColor" stroke-width="1.5"/>
+                        </svg>
+                    </span>
+                    <span class="nav-label">项目</span>
+                </button>
+                <button class="nav-item" data-view="list" data-key="experts">
+                    <span class="nav-icon">
+                        <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+                            <rect x="2" y="2" width="12" height="12" rx="3" stroke="currentColor" stroke-width="1.5"/>
+                            <path d="M5 8h6M8 5v6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+                        </svg>
+                    </span>
+                    <span class="nav-label">专家·技能·连接器</span>
+                </button>
+                <button class="nav-item" data-view="list" data-key="automation">
+                    <span class="nav-icon">
+                        <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+                            <circle cx="8" cy="8" r="6" stroke="currentColor" stroke-width="1.5"/>
+                            <path d="M8 4v4l3 2" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+                        </svg>
+                    </span>
+                    <span class="nav-label">自动化</span>
+                </button>
+                <button class="nav-item" data-view="list" data-key="library">
+                    <span class="nav-icon">
+                        <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+                            <path d="M2 4l6-2 6 2v8l-6 2-6-2V4z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/>
+                            <path d="M2 4l6 2 6-2" stroke="currentColor" stroke-width="1.5"/>
+                        </svg>
+                    </span>
+                    <span class="nav-label">资料库</span>
+                </button>
+                <button class="nav-item" data-view="list" data-key="more">
+                    <span class="nav-icon">
+                        <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+                            <circle cx="8" cy="4" r="1" fill="currentColor"/>
+                            <circle cx="8" cy="8" r="1" fill="currentColor"/>
+                            <circle cx="8" cy="12" r="1" fill="currentColor"/>
+                        </svg>
+                    </span>
+                    <span class="nav-label">更多</span>
+                </button>
+                <button class="nav-item" data-view="list" data-key="apps">
+                    <span class="nav-icon">
+                        <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+                            <rect x="2" y="2" width="5" height="5" rx="1" stroke="currentColor" stroke-width="1.5"/>
+                            <rect x="9" y="2" width="5" height="5" rx="1" stroke="currentColor" stroke-width="1.5"/>
+                            <rect x="2" y="9" width="5" height="5" rx="1" stroke="currentColor" stroke-width="1.5"/>
+                            <rect x="9" y="9" width="5" height="5" rx="1" stroke="currentColor" stroke-width="1.5"/>
+                        </svg>
+                    </span>
+                    <span class="nav-label">应用·灵感</span>
+                </button>
+                <button class="nav-item" data-view="list" data-key="settings">
+                    <span class="nav-icon">
+                        <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+                            <circle cx="8" cy="8" r="3" stroke="currentColor" stroke-width="1.5"/>
+                            <path d="M8 1v3M8 12v3M1 8h3M12 8h3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+                        </svg>
+                    </span>
+                    <span class="nav-label">设置</span>
+                </button>
+            </nav>
+
+            <div class="sidebar-section">
+                <div class="section-title" id="taskTitle">
+                    <span>任务</span>
+                    <span class="section-badge" id="taskCount">0</span>
+                </div>
+                <div class="section-list" id="taskList"></div>
+            </div>
+
+            <div class="sidebar-footer">
+                <div class="user-card">
+                    <div class="user-avatar">
+                        <svg width="20" height="20" viewBox="0 0 20 20" fill="none">
+                            <circle cx="10" cy="7" r="4" stroke="#9aa0aa" stroke-width="1.5"/>
+                            <path d="M3 17c0-3.3 3.1-6 7-6s7 2.7 7 6" stroke="#9aa0aa" stroke-width="1.5" stroke-linecap="round"/>
+                        </svg>
+                    </div>
+                    <div class="user-meta">
+                        <span class="user-name">本地用户</span>
+                        <span class="user-sub">完成任务赢积分 ›</span>
+                    </div>
+                </div>
+            </div>
+        </aside>
+
+        <!-- ===================== Main ===================== -->
+        <main class="main">
+            <!-- Chat view -->
+            <section class="view view-chat" id="viewChat">
+                <div class="topbar">
+                    <div class="topbar-left">
+                        <div class="topbar-title">sdpost-claw</div>
+                        <div class="topbar-status" id="statusIndicator">
+                            <span class="status-dot" id="statusDot"></span>
+                            <span id="statusText">就绪</span>
+                        </div>
+                    </div>
+                    <div class="topbar-right">
+                        <span class="points-badge" id="pointsBadge">0 积分</span>
+                        <button class="icon-btn" id="clearBtn" title="清空对话">
+                            <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
+                                <path d="M2 4h10M5 4V2.5A.5.5 0 015.5 2h3a.5.5 0 01.5.5V4M11 4v7.5a1.5 1.5 0 01-1.5 1.5h-5A1.5 1.5 0 013 11.5V4" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/>
+                            </svg>
+                        </button>
+                    </div>
+                </div>
+
+                <!-- Live dispatch ticker -->
+                <div class="ticker" id="ticker">
+                    <div class="ticker-inner" id="tickerInner">
+                        <span class="ticker-msg">系统就绪 · 等待您的指令</span>
+                    </div>
+                </div>
+
+                <div class="chat-scroll" id="chatScroll">
+                    <!-- Hero / home -->
+                    <div class="chat-hero" id="chatHero">
+                        <div class="hero-icon">
+                            <svg width="48" height="48" viewBox="0 0 48 48" fill="none">
+                                <rect x="4" y="4" width="40" height="40" rx="10" stroke="#bef264" stroke-width="2"/>
+                                <path d="M16 24h16M24 16v16" stroke="#bef264" stroke-width="2.5" stroke-linecap="round"/>
+                                <circle cx="24" cy="24" r="5" fill="#bef264" opacity="0.2"/>
+                            </svg>
+                        </div>
+                        <h1 class="hero-title">今天帮你做些什么？</h1>
+                        <p class="hero-sub">用自然语言下达任务，sdpost-claw 自主规划并执行</p>
+
+                        <div class="category-chips" id="categoryChips"></div>
+
+                        <div class="quick-entries" id="quickEntries"></div>
+                    </div>
+
+                    <!-- Messages -->
+                    <div class="chat-messages" id="chatMessages"></div>
+                </div>
+
+                <div class="input-area">
+                    <div class="input-box-wrap">
+                        <textarea id="inputBox" class="input-box" rows="1"
+                            placeholder="输入指令，或 @引用文件 / /调用技能..." spellcheck="false"></textarea>
+                        <button class="send-btn" id="sendBtn" title="发送">
+                            <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+                                <path d="M2 8l12-6-6 12-2-4-4-2z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/>
+                            </svg>
+                        </button>
+                    </div>
+                    <div class="input-options">
+                        <label class="opt">
+                            <span class="opt-label">模型</span>
+                            <select id="modelSelect" class="opt-select"></select>
+                        </label>
+                        <label class="opt">
+                            <span class="opt-label">工作空间</span>
+                            <select id="workspaceSelect" class="opt-select"></select>
+                        </label>
+                        <label class="opt">
+                            <span class="opt-label">权限</span>
+                            <select id="modeSelect" class="opt-select">
+                                <option value="build">build（完全访问）</option>
+                                <option value="plan">plan（只读）</option>
+                                <option value="general">general（子任务）</option>
+                            </select>
+                        </label>
+                        <button class="opt-btn" id="scrollTopBtn" title="回到顶部">
+                            <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
+                                <path d="M6 10V2M2 6l4-4 4 4" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/>
+                            </svg>
+                        </button>
+                    </div>
+                </div>
+            </section>
+
+            <!-- List view (projects / experts / etc.) -->
+            <section class="view view-list hidden" id="viewList">
+                <div class="list-header" id="listHeader">标题</div>
+                <div class="list-body" id="listBody"></div>
+            </section>
+        </main>
+    </div>
+
+    <!-- ===================== Folder Picker Modal ===================== -->
+    <div class="modal-overlay hidden" id="folderModal">
+        <div class="modal">
+            <div class="modal-header">
+                <h2 class="modal-title">选择工作空间文件夹</h2>
+                <button class="icon-btn modal-close" id="folderModalClose">
+                    <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
+                        <path d="M2 2l10 10M12 2L2 12" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+                    </svg>
+                </button>
+            </div>
+            <div class="modal-body">
+                <div class="form-group">
+                    <div class="input-with-btn">
+                        <button class="opt-btn" id="folderUpBtn" title="上一级">↑ 上级</button>
+                        <input type="text" class="form-input" id="folderPathInput"
+                            placeholder="输入或粘贴路径后回车…" spellcheck="false">
+                    </div>
+                </div>
+                <div class="folder-list" id="folderList"></div>
+                <div class="form-actions">
+                    <button class="btn btn-ghost" id="folderCancelBtn">取消</button>
+                    <div class="form-actions-right">
+                        <button class="btn btn-primary" id="folderConfirmBtn">选择此文件夹</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ===================== Model Config Modal ===================== -->
+    <div class="modal-overlay hidden" id="modelModal">
+        <div class="modal">
+            <div class="modal-header">
+                <h2 class="modal-title" id="modelModalTitle">配置模型</h2>
+                <button class="icon-btn modal-close" id="modelModalClose">
+                    <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
+                        <path d="M2 2l10 10M12 2L2 12" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+                    </svg>
+                </button>
+            </div>
+            <div class="modal-body" id="modelModalBody">
+                <div class="form-group">
+                    <label class="form-label">模型 ID</label>
+                    <input type="text" class="form-input" id="editModelId" placeholder="例如: my-model" readonly>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">显示名称</label>
+                    <input type="text" class="form-input" id="editModelName" placeholder="例如: 我的模型">
+                </div>
+                <div class="form-group">
+                    <label class="form-label">所属厂商</label>
+                    <input type="text" class="form-input" id="editModelProvider" placeholder="例如: OpenAI, DeepSeek, 阿里云">
+                </div>
+                <div class="form-group">
+                    <label class="form-label">模型名</label>
+                    <input type="text" class="form-input" id="editModelModel" placeholder="例如: deepseek-chat, qwen-max, glm-4-plus">
+                </div>
+                <div class="form-group">
+                    <label class="form-label">API Key</label>
+                    <div class="input-with-btn">
+                        <input type="password" class="form-input" id="editModelApiKey" placeholder="sk-..." autocomplete="off">
+                        <button class="opt-btn" id="toggleApiKeyBtn" title="显示/隐藏">显示</button>
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Base URL</label>
+                    <input type="text" class="form-input" id="editModelBaseUrl" placeholder="https://api.openai.com/v1">
+                </div>
+                <div class="form-actions">
+                    <button class="btn btn-ghost" id="testModelBtn">测试连接</button>
+                    <div class="form-actions-right">
+                        <button class="btn btn-ghost" id="deleteModelBtn">删除</button>
+                        <button class="btn btn-primary" id="saveModelBtn">保存</button>
+                    </div>
+                </div>
+                <div class="test-result hidden" id="testResult"></div>
+            </div>
+        </div>
+    </div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>
