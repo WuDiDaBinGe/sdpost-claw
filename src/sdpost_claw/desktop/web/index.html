@@ -141,9 +141,22 @@
 
                 <div class="input-area">
                     <div class="input-box-wrap">
+                        <div class="attach-tray hidden" id="attachTray"></div>
                         <div class="mention-popup hidden" id="mentionPopup"></div>
+                        <div class="skill-panel hidden" id="skillPanel">
+                            <div class="skill-panel-head">
+                                <span class="skill-panel-title">选择技能</span>
+                                <input type="text" id="skillPanelSearch" class="skill-panel-search" placeholder="搜索技能…" spellcheck="false">
+                            </div>
+                            <div class="skill-panel-body" id="skillPanelList"></div>
+                            <div class="skill-panel-foot">
+                                <span class="skill-panel-count" id="skillPanelCount">未选择</span>
+                                <button class="btn btn-ghost" id="skillPanelClear">清空勾选</button>
+                                <button class="btn btn-primary" id="skillPanelConfirm" disabled>添加</button>
+                            </div>
+                        </div>
                         <textarea id="inputBox" class="input-box" rows="1"
-                            placeholder="输入指令，或 @引用文件 / /调用技能..." spellcheck="false"></textarea>
+                            placeholder="输入指令，或 /调用技能..." spellcheck="false"></textarea>
                         <button class="send-btn" id="sendBtn" title="发送">
                             <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
                                 <path d="M2 8l12-6-6 12-2-4-4-2z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/>
@@ -151,6 +164,18 @@
                         </button>
                     </div>
                     <div class="input-options">
+                        <button class="opt-btn" id="attachFileBtn" title="浏览并引用本地文件">
+                            <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
+                                <path d="M10.5 3.5v6a1.5 1.5 0 01-1.5 1.5H3A1.5 1.5 0 011.5 9.5v-7A1.5 1.5 0 013 1h3l1.5 1.5H9a1.5 1.5 0 011.5 1.5v-.5z" stroke="currentColor" stroke-width="1.1" stroke-linejoin="round"/>
+                            </svg>
+                            <span>📎 文件</span>
+                        </button>
+                        <button class="opt-btn" id="attachSkillBtn" title="浏览并添加技能">
+                            <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
+                                <path d="M6 1l1.4 3 3.1.4-2.3 2.1.6 3-2.8-1.6L3.2 9.5l.6-3L1.5 4.4 4.6 4 6 1z" stroke="currentColor" stroke-width="1.1" stroke-linejoin="round"/>
+                            </svg>
+                            <span>⭐ 技能</span>
+                        </button>
                         <label class="opt">
                             <span class="opt-label">模型</span>
                             <select id="modelSelect" class="opt-select"></select>
@@ -265,6 +290,6 @@
         </div>
     </div>
 
-    <script src="/static/app.js?v=3"></script>
+    <script src="/static/app.js?v=9"></script>
 </body>
 </html>

@@ -67,6 +67,15 @@ class SkillRegistry:
         self._sources.append(source)
         self._cache.clear()
 
+    def reset_sources(self) -> None:
+        """Drop all sources (for hot re-registration after config changes)."""
+        self._sources.clear()
+        self._cache.clear()
+
+    def refresh(self) -> None:
+        """Clear the per-source caches so the next list_all() re-scans disks."""
+        self._cache.clear()
+
     async def list_all(self) -> list[SkillInfo]:
         """List all skills from all sources."""
         skills: dict[str, SkillInfo] = {}
@@ -104,23 +113,37 @@ class SkillRegistry:
         return []
 
     async def _load_from_directory(self, directory: Path) -> list[SkillInfo]:
-        """Load skills from a directory."""
+        """Load skills from a directory (opencode-style glob semantics).
+
+        Matches top-level ``*.md`` files plus any nested ``SKILL.md``.
+        Uses ``os.walk`` instead of ``Path.rglob`` so that broken symlinks
+        or unreadable subdirectories are skipped instead of aborting the
+        whole scan (``rglob`` raises on e.g. dangling directory links).
+        """
+        import os
+
         skills: list[SkillInfo] = []
 
         if not directory.exists():
             return skills
 
-        # Find all markdown files
-        patterns = ["*.md", "**/SKILL.md", "**/skill.md"]
-        found_files: set[Path] = set()
+        root_str = str(directory)
+        found_files: list[Path] = []
 
-        for pattern in patterns:
-            for filepath in directory.rglob(pattern):
-                if filepath.is_file() and filepath not in found_files:
-                    found_files.add(filepath)
+        def _on_walk_error(_err: OSError) -> None:
+            pass  # skip unreadable/broken entries
+
+        for root, _dirs, files in os.walk(directory, onerror=_on_walk_error):
+            for fn in files:
+                low = fn.lower()
+                is_top = root == root_str
+                if low.endswith(".md") and (low == "skill.md" or is_top):
+                    found_files.append(Path(root) / fn)
 
         for filepath in found_files:
             try:
+                if not filepath.is_file():
+                    continue
                 content = filepath.read_text(encoding="utf-8")
                 frontmatter = self._parse_frontmatter(content)
 
@@ -141,7 +164,7 @@ class SkillRegistry:
                     location=filepath,
                     content=content,
                 ))
-            except (OSError, UnicodeDecodeError):
+            except (OSError, UnicodeDecodeError, yaml.YAMLError):
                 continue
 
         return skills

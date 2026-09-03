@@ -111,14 +111,8 @@ class DesktopServer:
         # Register tools
         BuiltInTools.register_all(self.tool_registry, str(Path.cwd()))
 
-        # Register skill sources (bundled + configured)
-        for bundled in _bundled_skill_dirs():
-            if bundled.exists():
-                self.skill_registry.add_source(SkillSource.directory(bundled))
-        for d in self.config.skill_dirs:
-            p = Path(d)
-            if p.exists():
-                self.skill_registry.add_source(SkillSource.directory(p))
+        # Register skill sources (see _register_skill_sources for priority)
+        self._register_skill_sources()
 
         # Setup model provider. Resolve credentials from the matching
         # ModelEntry if config.model lacks base_url / api_key (e.g.
@@ -167,9 +161,11 @@ class DesktopServer:
 
         # Local filesystem browsing (workspace folder picker)
         self._app.router.add_get("/api/fs/browse", self.handle_fs_browse)
+        self._app.router.add_get("/api/fs/pick-file", self.handle_pick_file)
 
         # Sidebar / extension data
         self._app.router.add_get("/api/skills", self.handle_list_skills)
+        self._app.router.add_post("/api/skills/rescan", self.handle_rescan_skills)
         self._app.router.add_get("/api/experts", self.handle_list_experts)
         self._app.router.add_get("/api/connectors", self.handle_list_connectors)
         self._app.router.add_get("/api/spaces", self.handle_list_spaces)
@@ -186,6 +182,35 @@ class DesktopServer:
         self._app.router.add_put("/api/models/{model_id}", self.handle_update_model)
         self._app.router.add_post("/api/models/delete", self.handle_batch_delete_models)
         self._app.router.add_post("/api/models/test", self.handle_test_model)
+
+    # ------------------------------------------------------------------
+    # Skill sources: registration, auto-scan (opencode-style directory scan)
+    # ------------------------------------------------------------------
+    def _register_skill_sources(self) -> None:
+        """(Re-)register skill directory sources (opencode-style).
+
+        ``SkillRegistry.list_all`` is last-wins on name conflicts, so the
+        registration order below *reverses* the intended priority:
+
+            1. Global skills (``<sdpost_home>/skills`` — drop a skill
+               folder here to override the bundled defaults)
+            2. Bundled default skills (src/skills)
+            3. User-configured extra directories (config.skill_dirs)
+
+        I.e. a global skill overrides a bundled skill with the same name,
+        which in turn overrides one from a configured directory.
+        """
+        self.skill_registry.reset_sources()
+        for d in self.config.skill_dirs:                       # lowest priority
+            p = Path(d)
+            if p.exists():
+                self.skill_registry.add_source(SkillSource.directory(p))
+        for bundled in _bundled_skill_dirs():
+            if bundled.exists():
+                self.skill_registry.add_source(SkillSource.directory(bundled))
+        global_dir = self.config.sdpost_home / "skills"        # highest priority
+        global_dir.mkdir(parents=True, exist_ok=True)
+        self.skill_registry.add_source(SkillSource.directory(global_dir))
 
     # ------------------------------------------------------------------
     # SSE helpers
@@ -301,21 +326,31 @@ class DesktopServer:
         (with slash commands rendered as ``/name``) is part of the system
         context baseline, so ``/<skill>`` input can be resolved by the model.
         """
-        if getattr(self, "_skills_in_context", False):
+        if getattr(self, "_skills_context_source", None) is not None:
             return
-        self._skills_in_context = True
+        await self._refresh_skills_in_context(register=True)
+
+    async def _refresh_skills_in_context(self, register: bool = False) -> None:
+        """(Re)load the skill list into the agent/skills context source.
+
+        Called lazily on the first prompt and again after skill_dirs changes
+        so the latest skill set is immediately usable.
+        """
         try:
             skills = await self.skill_registry.list_all()
         except Exception:
             skills = []
-        if not skills:
-            return
-        self.system_context.register(AgentSkillsContextSource(
-            skills=[
-                ContextSkillInfo(name=s.name, description=s.description, slash=s.slash)
-                for s in skills
-            ]
-        ))
+        infos = [
+            ContextSkillInfo(name=s.name, description=s.description, slash=s.slash)
+            for s in skills
+        ]
+        src = getattr(self, "_skills_context_source", None)
+        if src is None and register:
+            src = AgentSkillsContextSource(skills=infos)
+            self._skills_context_source = src
+            self.system_context.register(src)
+        elif src is not None:
+            src._skills = infos  # in-place refresh keeps the registry singleton
 
     async def _process_prompt(self, session: Session, text: str) -> None:
         """Process prompt through agent loop and stream events."""
@@ -538,8 +573,9 @@ class DesktopServer:
     # Sidebar / extension data
     # ------------------------------------------------------------------
     async def handle_list_skills(self, request: web.Request) -> web.Response:
-        """List available skills."""
+        """List available skills (re-scans all skill directories)."""
         try:
+            self.skill_registry.refresh()  # auto-scan on every request
             skills = await self.skill_registry.list_all()
         except Exception:
             skills = []
@@ -547,6 +583,25 @@ class DesktopServer:
             {"name": s.name, "description": s.description, "location": str(s.location), "slash": s.slash}
             for s in skills
         ]})
+
+    async def handle_rescan_skills(self, request: web.Request) -> web.Response:
+        """Force a full skill rescan: re-check configured directories on disk,
+        reload all skill sources and refresh the agent skills context."""
+        self._register_skill_sources()
+        self.skill_registry.refresh()
+        await self._refresh_skills_in_context()
+        try:
+            skills = await self.skill_registry.list_all()
+        except Exception:
+            skills = []
+        return web.json_response({
+            "status": "ok",
+            "count": len(skills),
+            "skills": [
+                {"name": s.name, "description": s.description, "location": str(s.location), "slash": s.slash}
+                for s in skills
+            ],
+        })
 
     async def handle_list_experts(self, request: web.Request) -> web.Response:
         """List available experts."""
@@ -604,6 +659,35 @@ class DesktopServer:
 
         parent = str(p.parent) if p.parent != p else ""
         return web.json_response({"path": str(p), "parent": parent, "dirs": dirs, "files": files})
+
+    async def handle_pick_file(self, request: web.Request) -> web.Response:
+        """Open the OS-native file selection dialog and return chosen paths.
+
+        Runs tkinter's askopenfilenames (multi-select) in a worker thread so
+        the asyncio loop is not blocked while the modal dialog is open.
+        """
+        def _pick() -> list[str]:
+            import tkinter as tk
+            from tkinter import filedialog
+            root = tk.Tk()
+            root.withdraw()
+            root.attributes("-topmost", True)
+            root.update()
+            try:
+                paths = filedialog.askopenfilenames(
+                    parent=root, title="选择要引用的文件",
+                )
+                return [str(p) for p in paths]
+            finally:
+                root.destroy()
+
+        try:
+            files = await asyncio.to_thread(_pick)
+        except Exception as e:
+            return web.json_response(
+                {"error": f"无法打开系统文件选择框: {e}"}, status=500
+            )
+        return web.json_response({"files": files})
 
     async def handle_list_spaces(self, request: web.Request) -> web.Response:
         """List workspaces/spaces derived from session cwds."""
@@ -731,6 +815,8 @@ class DesktopServer:
                     setattr(self.config.compaction, k, max(1, c[k]))
         if "skill_dirs" in data and isinstance(data["skill_dirs"], list):
             self.config.skill_dirs = [str(d).strip() for d in data["skill_dirs"] if str(d).strip()]
+            self._register_skill_sources()  # hot-reload skill directories
+            await self._refresh_skills_in_context()  # keep the agent context source in sync
         if "log_level" in data:
             self.config.log_level = str(data["log_level"]).upper()
         if "audit_enabled" in data:
