@@ -1,5 +1,12 @@
 # Module 03: Memory & Context v2 — 记忆与上下文系统（opencode 增强版）
 
+> **v2.1 实现对齐说明（2026-09-03）**：本节已按实际代码更新。要点变更：
+> - `initialize()` 对 `Unavailable` 源的实际行为是**跳过**（不贡献基线），不抛 `InitializationBlocked`（仅保留异常类型）
+> - 内置 Context Sources 实际为 7 个：Date / ProjectInstructions / AgentSkills / WorkspaceMemory / UserPreferences / **Summary** / **AgentInfo**；后两者的构造方式与初版不同（直接持有值而非依赖注册表）
+> - `MidConversationSystemMessageHandler.handle(snapshot)` 返回 `(message, new_snapshot)` 元组，不依赖 Session 对象
+> - **压缩的实际链路**：无状态 `CompactionEngine`（策略）+ 有状态 `CompactionBridge`（协调器）→ 摘要写入 `session.summary` → 由 `SummaryContextSource` 经 reconcile"新可用源"路径注入，**不做基线 replace**
+> - Workspace Memory 实际为**文件存储**（`memory/workspace.py` JSON），非 SQLite
+
 ## 1. 设计演进说明
 
 本模块是本次升级的核心模块，全面借鉴 opencode 的上下文管理系统：
@@ -13,7 +20,7 @@
 
 ---
 
-## 2. System Context 架构（核心改进）
+## 2. System Context 架构（实际实现于 context/ 包）
 
 ### 2.1 设计理念
 
@@ -31,889 +38,387 @@
 │   │        示例: "date/current", "project/instructions",        │   │
 │   │              "agent/skills", "workspace/memory"             │   │
 │   │                                                             │   │
-│   │   codec: Schema 编解码器                                     │   │
 │   │   load: 加载当前值 (可能返回 Unavailable)                     │   │
 │   │   baseline: 首次渲染为模型可见文本                            │   │
 │   │   update: 变更时生成更新文本                                  │   │
 │   │   removed: 可选移除文本生成器                                 │   │
-│   │                                                             │   │
 │   └─────────────────────────────────────────────────────────────┘   │
 │                                                                      │
 │   ┌─────────────────────────────────────────────────────────────┐   │
 │   │                    System Context (系统上下文)               │   │
-│   │                                                             │   │
 │   │   不透明载体，组合多个 Context Source                         │   │
-│   │   支持顺序组合，拒绝重复 key                                  │   │
-│   │                                                             │   │
+│   │   支持顺序组合，拒绝重复 key（DuplicateKeyError）             │   │
 │   └─────────────────────────────────────────────────────────────┘   │
 │                                                                      │
 │   ┌─────────────────────────────────────────────────────────────┐   │
 │   │                    Context Epoch (上下文纪元)                │   │
-│   │                                                             │   │
 │   │   - 初始渲染的 System Context 保持不变的时间跨度             │   │
-│   │   - 在压缩、会话迁移或不兼容转换时结束                        │   │
 │   │   - 每个 Epoch 有不可变的 Baseline System Context            │   │
-│   │                                                             │   │
+│   │   - 实际位于 context/epoch.py（类型已实现，持久化触发待接入）│   │
 │   └─────────────────────────────────────────────────────────────┘   │
 │                                                                      │
 │   ┌─────────────────────────────────────────────────────────────┐   │
 │   │                    Context Snapshot (上下文快照)             │   │
-│   │                                                             │   │
-│   │   - 可覆盖的模型隐藏 JSON 状态                                │   │
-│   │   - 用于比较每个 Context Source 上次提交的值                  │   │
-│   │   - 原子性更新，与 Mid-Conversation System Message 同步     │   │
-│   │                                                             │   │
+│   │   - 可比较的模型隐藏 JSON 状态                                │   │
+│   │   - reconcile 用来比较每个源上次提交的值                      │   │
+│   │   - 与 Mid-Conversation System Message 同步更新              │   │
 │   └─────────────────────────────────────────────────────────────┘   │
-│                                                                      │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
-### 2.2 Context Source 接口定义
+实际文件布局（context/）：
+
+| 文件 | 内容 |
+|------|------|
+| source.py | `ContextSource` 接口、`Unavailable`、全部内置源与值类型 |
+| registry.py | `SystemContextRegistry`、`Snapshot` / `SourceSnapshot` / `Generation`、协调与替换结果类型 |
+| epoch.py | `ContextEpoch`（`initial()` / `is_active` / `end(reason)` / baseline/snapshot 属性） |
+| reconcile.py | 协调辅助 |
+| midconv.py | `MidConversationSystemMessage`、`MidConversationSystemMessageHandler`、`ContextUnavailableError` |
+| compaction.py | `COMPACTION_TEMPLATE`、`COMPACTION_UPDATE_INSTRUCTIONS`、`CompactionConfig`、无状态 `CompactionEngine` |
+| snapshot.py | 快照辅助 |
+
+### 2.2 Context Source 接口与 Registry（实际签名）
 
 ```python
 class ContextSource(ABC, Generic[A]):
-    """
-    上下文源 - 借鉴 opencode 的 Source<A> 设计
-
-    每个 Context Source 是独立可刷新的类型化值
-    """
+    """上下文源 - 独立可刷新的类型化值"""
 
     @property
     @abstractmethod
-    def key(self) -> str:
-        """
-        稳定的命名空间标识符
-        格式: "domain/subdomain[/qualifier]"
-        示例: "date/current", "project/instructions"
-        """
-        pass
-
+    def key(self) -> str: ...
     @abstractmethod
-    async def load(self) -> A | Unavailable:
-        """
-        加载当前值
-        返回 Unavailable 表示临时无法观察，保留上次状态
-        与移除不同：刷新保留快照，替换等待
-        """
-        pass
-
+    async def load(self) -> A | Unavailable: ...
     @abstractmethod
-    def baseline(self, value: A) -> str:
-        """首次渲染为模型可见文本"""
-        pass
-
+    def baseline(self, value: A) -> str: ...
     @abstractmethod
-    def update(self, previous: A, current: A) -> str:
-        """变更时生成更新文本"""
-        pass
-
+    def update(self, previous: A, current: A) -> str: ...
     def removed(self, previous: A) -> str | None:
-        """可选的移除文本生成器"""
         return None
 
+
 class SystemContextRegistry:
-    """
-    系统上下文注册表 - 借鉴 opencode 的 System Context Registry
+    """管理有序、有作用域的上下文贡献者（context/registry.py）"""
 
-    管理有序、有作用域的上下文贡献者
-    """
-
-    def __init__(self):
-        self._sources: dict[str, ContextSource] = {}
-        self._order: list[str] = []
-
-    def register(self, source: ContextSource):
-        """注册上下文源"""
-        if source.key in self._sources:
-            raise DuplicateKeyError(f"重复的上下文源 key: {source.key}")
-        self._sources[source.key] = source
-        self._order.append(source.key)
-
-    def unregister(self, key: str):
-        """注销上下文源"""
-        self._sources.pop(key, None)
-        if key in self._order:
-            self._order.remove(key)
+    def register(self, source): ...   # 重复 key 抛 DuplicateKeyError
+    def unregister(self, key): ...
+    def get_source(self, key) -> ContextSource | None: ...
+    keys: list[str]                   # 属性
 
     async def initialize(self) -> Generation:
+        """生成基线文本与快照。
+
+        实际行为：Unavailable 的源被**跳过**（不贡献基线、不入快照），
+        不抛 InitializationBlocked——否则任何可选源缺失
+        （如项目无 AGENTS.md）都会让整个上下文系统不可用。
         """
-        初始化 System Context
-        生成基线和快照
-        """
-        baseline_parts = []
-        snapshot = {}
 
-        for key in self._order:
-            source = self._sources[key]
-            value = await source.load()
+    async def reconcile(self, snapshot: Snapshot) -> ReconcileResult:
+        """比较当前值与快照，返回 Unchanged / Updated /
+        ReplacementReady / ReplacementBlocked。
+        Unavailable 且已有已提交快照 → 保留上次状态；新注册的源 →
+        用 baseline(value) 作为更新文本。"""
 
-            if isinstance(value, Unavailable):
-                raise InitializationBlocked(unavailable_keys=[key])
-
-            baseline_parts.append(source.baseline(value))
-            snapshot[key] = SourceSnapshot(
-                value=value,
-                removed=None,
-            )
-
-        return Generation(
-            baseline="\n\n".join(baseline_parts),
-            snapshot=Snapshot(entries=snapshot),
-        )
-
-    async def reconcile(
-        self,
-        snapshot: Snapshot,
-    ) -> ReconcileResult:
-        """
-        协调上下文 - 比较当前值与快照
-
-        返回:
-        - Unchanged: 无变化
-        - Updated: 有更新，生成 Mid-Conversation System Message
-        - ReplacementReady: 需要替换基线（如压缩后）
-        - ReplacementBlocked: 替换被阻塞（有不可用上下文）
-        """
-        updates = []
-        new_snapshot = {}
-        has_changes = False
-
-        for key in self._order:
-            source = self._sources[key]
-            value = await source.load()
-
-            if isinstance(value, Unavailable):
-                # 不可用，保留上次状态
-                new_snapshot[key] = snapshot.entries.get(key)
-                continue
-
-            old_entry = snapshot.entries.get(key)
-
-            if old_entry is None:
-                # 新注册的源
-                updates.append(source.baseline(value))
-                new_snapshot[key] = SourceSnapshot(value=value)
-                has_changes = True
-            elif old_entry.value != value:
-                # 值变更
-                updates.append(source.update(old_entry.value, value))
-                new_snapshot[key] = SourceSnapshot(value=value)
-                has_changes = True
-            else:
-                new_snapshot[key] = old_entry
-
-        if not has_changes:
-            return ReconcileResult(tag="Unchanged")
-
-        return ReconcileResult(
-            tag="Updated",
-            text="\n".join(updates),
-            snapshot=Snapshot(entries=new_snapshot),
-        )
-
-    async def replace(
-        self,
-        snapshot: Snapshot,
-    ) -> ReplacementResult:
-        """
-        完全替换 System Context
-        用于压缩后或会话迁移
-        """
-        has_unavailable = False
-        baseline_parts = []
-        new_snapshot = {}
-
-        for key in self._order:
-            source = self._sources[key]
-            value = await source.load()
-
-            if isinstance(value, Unavailable):
-                # 检查是否有已提交的快照
-                if key in snapshot.entries:
-                    has_unavailable = True
-                    break
-                continue
-
-            baseline_parts.append(source.baseline(value))
-            new_snapshot[key] = SourceSnapshot(value=value)
-
-        if has_unavailable:
-            return ReplacementResult(tag="ReplacementBlocked")
-
-        return ReplacementResult(
-            tag="ReplacementReady",
-            generation=Generation(
-                baseline="\n\n".join(baseline_parts),
-                snapshot=Snapshot(entries=new_snapshot),
-            ),
-        )
+    async def replace(self, snapshot: Snapshot) -> ReplacementResult:
+        """完全替换基线（压缩后/会话迁移）。
+        已提交的源变为 Unavailable → ReplacementBlocked（丢弃会丢上下文）；
+        否则 ReplacementReadyRep 携带新 Generation。"""
 ```
 
-### 2.3 内置 Context Sources
+> 注：`ReplacementReady` / `ReplacementBlocked` 是 `ReconcileResult` 的子类（reconcile 路径），`ReplacementReadyRep` / `ReplacementBlockedRep` 是 `ReplacementResult` 的子类（replace 路径），实际代码中两组类型并存。
+
+### 2.3 内置 Context Sources（实际 7 个，见 context/source.py）
 
 ```python
 class DateContextSource(ContextSource[DateValue]):
-    """日期上下文源"""
-
-    key = "date/current"
-
-    async def load(self) -> DateValue | Unavailable:
-        now = datetime.now()
-        return DateValue(
-            date=now.strftime("%Y-%m-%d"),
-            time=now.strftime("%H:%M:%S"),
-            timezone=str(now.astimezone().tzinfo),
-            weekday=now.strftime("%A"),
-        )
-
-    def baseline(self, value: DateValue) -> str:
-        return (
-            f"## Current Date & Time\n"
-            f"Date: {value.date} ({value.weekday})\n"
-            f"Time: {value.time} ({value.timezone})"
-        )
-
-    def update(self, previous: DateValue, current: DateValue) -> str:
-        return f"Date changed: {previous.date} → {current.date}"
+    """key="date/current"：date/time/timezone/weekday，变更时输出 "Date changed: X -> Y" """
 
 class ProjectInstructionsContextSource(ContextSource[InstructionsValue]):
-    """项目指令上下文源 - 发现 AGENTS.md / CLAUDE.md / .cursorrules 等"""
-
-    key = "project/instructions"
-
-    INSTRUCTION_FILES = [
-        "AGENTS.md",
-        "CLAUDE.md",
-        ".cursorrules",
-        ".claude/CLAUDE.md",
-        ".github/copilot-instructions.md",
-    ]
-
-    def __init__(self, project_path: Path):
-        self.project_path = project_path
-
-    async def load(self) -> InstructionsValue | Unavailable:
-        instructions = []
-
-        for pattern in self.INSTRUCTION_FILES:
-            file_path = self.project_path / pattern
-            if file_path.exists():
-                instructions.append(Instruction(
-                    source=str(file_path),
-                    content=file_path.read_text(encoding="utf-8"),
-                ))
-
-        if not instructions:
-            return Unavailable("No instruction files found")
-
-        return InstructionsValue(instructions=instructions)
-
-    def baseline(self, value: InstructionsValue) -> str:
-        parts = ["## Project Instructions"]
-        for inst in value.instructions:
-            parts.append(f"\n### From: {inst.source}\n{inst.content}")
-        return "\n".join(parts)
-
-    def update(self, previous: InstructionsValue, current: InstructionsValue) -> str:
-        return (
-            f"Project instructions updated: "
-            f"{len(previous.instructions)} → {len(current.instructions)} files"
-        )
+    """key="project/instructions"：发现 AGENTS.md / CLAUDE.md / .cursorrules /
+    .claude/CLAUDE.md / .github/copilot-instructions.md（读取失败静默跳过）；
+    无任何指令文件时返回 Unavailable"""
 
 class AgentSkillsContextSource(ContextSource[SkillsValue]):
-    """Agent 可用技能上下文源"""
-
-    key = "agent/skills"
-
-    def __init__(self, agent: Agent, skill_registry: SkillRegistry):
-        self.agent = agent
-        self.registry = skill_registry
-
-    async def load(self) -> SkillsValue | Unavailable:
-        # 只列出该 Agent 有权使用的技能名称和描述
-        available = self.registry.get_available_for_agent(self.agent.id)
-        if not available:
-            return Unavailable("No skills available")
-        return SkillsValue(skills=available)
-
-    def baseline(self, value: SkillsValue) -> str:
-        parts = ["## Available Skills"]
-        for skill in value.skills:
-            parts.append(f"- **{skill.name}**: {skill.description}")
-        return "\n".join(parts)
-
-    def update(self, previous: SkillsValue, current: SkillsValue) -> str:
-        return f"Skills updated: {len(previous.skills)} → {len(current.skills)} available"
+    """key="agent/skills"：构造时直接传入 list[SkillInfo]（name/description/slash），
+    不依赖 SkillRegistry 实例；空列表返回 Unavailable"""
 
 class WorkspaceMemoryContextSource(ContextSource[MemoryValue]):
-    """工作区记忆上下文源"""
-
-    key = "workspace/memory"
-
-    def __init__(self, memory_store: MemoryStore, workspace_id: str):
-        self.memory_store = memory_store
-        self.workspace_id = workspace_id
-
-    async def load(self) -> MemoryValue | Unavailable:
-        memory = await self.memory_store.get_workspace_memory(self.workspace_id)
-        if not memory:
-            return Unavailable("No workspace memory")
-        return MemoryValue(
-            daily_summary=memory.daily_summary,
-            recent_decisions=memory.recent_decisions[-5:],  # 最近 5 条
-            key_facts=memory.key_facts[-10:],  # 最近 10 条
-        )
-
-    def baseline(self, value: MemoryValue) -> str:
-        parts = ["## Workspace Memory"]
-
-        if value.daily_summary:
-            parts.append(f"\n### Today\n{value.daily_summary}")
-
-        if value.recent_decisions:
-            parts.append("\n### Recent Decisions")
-            for d in value.recent_decisions:
-                parts.append(f"- {d}")
-
-        if value.key_facts:
-            parts.append("\n### Key Facts")
-            for f in value.key_facts:
-                parts.append(f"- {f}")
-
-        return "\n".join(parts)
+    """key="workspace/memory"：构造时直接传入 MemoryValue
+    （daily_summary + recent_decisions + key_facts）"""
 
 class UserPreferencesContextSource(ContextSource[PreferencesValue]):
-    """用户偏好上下文源"""
+    """key="user/preferences"：构造时直接传入 PreferencesValue
+    （language/style/expertise）"""
 
-    key = "user/preferences"
+class SummaryContextSource(ContextSource[SummaryValue]):
+    """key="session/summary"：压缩摘要注入点（见 §4.3）"""
 
-    def __init__(self, user_store: UserStore):
-        self.user_store = user_store
-
-    async def load(self) -> PreferencesValue | Unavailable:
-        prefs = await self.user_store.get_preferences()
-        if not prefs:
-            return Unavailable("No user preferences")
-        return PreferencesValue(
-            language=prefs.language,
-            style=prefs.communication_style,
-            expertise=prefs.expertise_level,
-        )
-
-    def baseline(self, value: PreferencesValue) -> str:
-        return (
-            f"## User Preferences\n"
-            f"Language: {value.language}\n"
-            f"Style: {value.style}\n"
-            f"Expertise: {value.expertise}"
-        )
+class AgentContextSource(ContextSource[AgentValue]):
+    """key="agent/info"：name/mode/skills_count；mode 变更时输出
+    "Agent mode changed: X -> Y" """
 ```
+
+桌面端（desktop/server.py `setup()`）实际注册顺序：`DateContextSource → ProjectInstructionsContextSource(Path.cwd()) → AgentContextSource → SummaryContextSource`。SummaryContextSource 初始为空（Unavailable），首次压缩后才变为可用。
 
 ---
 
-## 3. Mid-Conversation System Message（对话中系统消息）
-
-### 3.1 设计理念（借鉴 opencode）
+## 3. Mid-Conversation System Message（实际实现于 context/midconv.py）
 
 ```python
+@dataclass
 class MidConversationSystemMessage:
-    """
-    对话中系统消息 - 借鉴 opencode 设计
+    """对话中系统消息：role="system"，
+    metadata={"type": "mid_conversation_update", "source_key", "timestamp"}"""
+    text: str
+    source_key: str | None = None
+    timestamp: datetime
 
-    用途: 在对话过程中传递状态变更指令
-    特点:
-    - 按时间顺序纳入 Session History
-    - 与 Context Snapshot 同步更新
-    - 在 Safe Provider-Turn Boundary 处理
-
-    示例:
-    - "The date is now 2026-08-28"
-    - "Project instructions updated: 2 files active"
-    - "Skills updated: 5 new skills available"
-    """
-
-    def __init__(self, text: str, source_key: str | None = None):
-        self.text = text
-        self.source_key = source_key
-        self.timestamp = datetime.now()
-
-    def to_message(self) -> Message:
-        return Message(
-            role="system",
-            content=self.text,
-            metadata={
-                "type": "mid_conversation_update",
-                "source_key": self.source_key,
-                "timestamp": self.timestamp.isoformat(),
-            },
-        )
 
 class MidConversationSystemMessageHandler:
-    """
-    对话中系统消息处理器
+    """在每次 Provider Turn 前协调上下文变更"""
 
-    在每次 Provider Turn 前协调上下文变更
-    """
+    def __init__(self, system_context: SystemContextRegistry): ...
 
-    def __init__(self, system_context: SystemContextRegistry):
-        self.system_context = system_context
-
-    async def handle(
-        self,
-        session: Session,
-    ) -> MidConversationSystemMessage | None:
+    async def handle(self, snapshot: Snapshot) -> tuple[MidConversationSystemMessage | None, Snapshot | None]:
         """
-        处理上下文协调
+        实际签名：接收快照（非 Session），返回 (message, new_snapshot)。
 
-        1. 获取当前快照
-        2. 协调上下文
-        3. 如有变更，生成 Mid-Conversation System Message
-        4. 更新快照
+        - Unchanged           → (None, None)
+        - Updated             → (MidConversationSystemMessage(text), result.snapshot)
+        - ReplacementReady    → (None, None)（基线替换由压缩链路处理，见 §4.3）
+        - ReplacementBlocked  → raise ContextUnavailableError(unavailable_keys)
         """
-        snapshot = await session.get_context_snapshot()
-        result = await self.system_context.reconcile(snapshot)
-
-        if result.tag == "Unchanged":
-            return None
-
-        elif result.tag == "Updated":
-            # 更新快照
-            await session.update_context_snapshot(result.snapshot)
-            return MidConversationSystemMessage(
-                text=result.text,
-                source_key=None,
-            )
-
-        elif result.tag == "ReplacementReady":
-            # 需要替换基线，开始新 Epoch
-            await session.start_new_epoch(result.generation)
-            return None
-
-        elif result.tag == "ReplacementBlocked":
-            # 有不可用上下文，阻塞
-            raise ContextUnavailableError(result.unavailable_keys)
-
-        return None
 ```
+
+> **实际接线**：`SafeProviderTurnBoundary.prepare()` 在 step 边界 `session.drain_injections()` 领取非唤醒注入（含 reconcile 产生的更新文本），拼接到 system_context 的 `## Context Update` 段（见 Module 01 §2.4）。压缩摘要走同一条 Inbox 注入路径。
 
 ---
 
-## 4. Compaction v2（结构化压缩）
+## 4. Compaction v2（实际实现：context/compaction.py + harness/compaction_bridge.py）
 
-### 4.1 设计理念（借鉴 opencode 的 SUMMARY_TEMPLATE）
+### 4.1 结构化摘要模板（无变化）
+
+`COMPACTION_TEMPLATE`（Objective / Important Details / Work State[Completed|Active|Blocked] / Next Move / Relevant Files）与 `COMPACTION_UPDATE_INSTRUCTIONS`（`<prior-summary>` + `<conversation>` 合并规则）与初版设计一致，见 [context/compaction.py](file:///f:/MyCoding/sdpost-claw/src/sdpost_claw/context/compaction.py)。
+
+### 4.2 CompactionEngine（无状态策略）
 
 ```python
-COMPACTION_TEMPLATE = """Output exactly the Markdown structure shown inside <template> and keep the section order unchanged. Do not include the <template> tags in your response.
-<template>
-## Objective
-- [one or two brief sentences describing what the user is trying to accomplish]
+@dataclass
+class CompactionConfig:
+    enabled: bool = True
+    max_tokens: int = 100000
+    buffer_tokens: int = 20000
+    keep_tokens: int = 8000
 
-## Important Details
-- [constraints/preferences, decisions and why, important facts/assumptions, exact context needed to continue, or "(none)"]
-
-## Work State
-### Completed
-- [finished work, verified facts, or changes made; otherwise "(none)"]
-
-### Active
-- [current work, partial changes, or investigation state; otherwise "(none)"]
-
-### Blocked
-- [blockers, failing commands, or unknowns; otherwise "(none)"]
-
-## Next Move
-1. [immediate concrete action, or "(none)"]
-2. [next action if known, or "(none)"]
-
-## Relevant Files
-- [file or directory path: why it matters, or "(none)"]
-</template>
-
-Rules:
-- Keep every section, even when empty.
-- Use terse bullets, not prose paragraphs.
-- Preserve exact file paths, symbols, commands, error strings, URLs, and identifiers when known.
-- Do not mention the summary process or that context was compacted."""
-
-COMPACTION_UPDATE_INSTRUCTIONS = """The <prior-summary> summarizes everything that happened before the <conversation>. Construct a new summary that combines both. The <prior-summary> is discarded after this: anything you do not carry into the new summary is lost.
-
-When combining:
-- Carry forward objectives, constraints, user directives, decisions, and parallel workstreams from the <prior-summary> even when the <conversation> does not mention them. Drop only what is finished and no longer needed.
-- The <conversation> is more recent than the <prior-summary>. Where they conflict, the conversation wins: state the corrected fact and drop the old claim.
-- Add new progress, decisions, constraints, and context from the conversation.
-- Move completed work from "Active" to "Completed".
-- If a blocker has been resolved, update the summary to reflect that while keeping any details still needed to continue the work.
-- Update "Objective" and "Next Move" to reflect the current work state."""
 
 class CompactionEngine:
-    """压缩引擎 - 借鉴 opencode 的结构化压缩"""
+    """无状态策略：阈值 + 提示模板（不调用模型）"""
 
-    def __init__(self, config: CompactionConfig, model: ModelProvider):
-        self.config = config
-        self.model = model
-        self.buffer_tokens = config.buffer_tokens  # 默认 20000
-        self.keep_tokens = config.keep_tokens      # 默认 8000
+    def should_compact(self, total_tokens: int) -> bool:
+        # enabled 且 total_tokens > (max_tokens - buffer_tokens)
 
-    async def should_compact(self, session: Session) -> bool:
-        """判断是否需要压缩"""
-        total_tokens = await session.count_tokens()
-        return total_tokens > (self.config.max_tokens - self.buffer_tokens)
+    def build_compaction_prompt(self, messages: list[dict],
+                                prior_summary: str | None = None
+                                ) -> tuple[str, str]:
+        # 返回 (system_prompt, user_content)
+        # 有 prior_summary 时走增量合并提示（<prior-summary> + <conversation>）
 
-    async def compact(self, session: Session) -> CompactionResult:
-        """
-        执行压缩
-
-        流程:
-        1. 获取当前完整历史
-        2. 生成结构化摘要
-        3. 创建新的 Context Epoch
-        4. 保留摘要作为新的基线
-        """
-        history = await session.get_full_history()
-
-        # 生成结构化摘要
-        summary = await self._generate_summary(history)
-
-        # 创建新的 Context Epoch
-        new_epoch = await session.start_new_epoch(
-            generation=await self._create_generation_with_summary(summary),
-            reason="compaction",
-        )
-
-        return CompactionResult(
-            epoch_id=new_epoch.id,
-            summary=summary,
-            tokens_before=sum(m.tokens for m in history),
-            tokens_after=self._count_tokens(summary),
-        )
-
-    async def _generate_summary(self, history: list[Message]) -> str:
-        """生成结构化摘要"""
-        # 检查是否有之前的摘要
-        prior_summary = await self._get_prior_summary(history)
-
-        if prior_summary:
-            # 增量更新
-            system = COMPACTION_TEMPLATE + "\n\n" + COMPACTION_UPDATE_INSTRUCTIONS
-            user_content = (
-                f"<prior-summary>\n{prior_summary}\n</prior-summary>\n\n"
-                f"<conversation>\n{self._format_history_for_compaction(history)}\n</conversation>"
-            )
-        else:
-            # 首次压缩
-            system = COMPACTION_TEMPLATE
-            user_content = self._format_history_for_compaction(history)
-
-        response = await self.model.generate(
-            system=system,
-            messages=[{"role": "user", "content": user_content}],
-        )
-        return response.text
-
-    async def _create_generation_with_summary(self, summary: str) -> Generation:
-        """创建包含摘要的新 Generation"""
-        # 重新初始化所有 Context Source
-        generation = await self.system_context.initialize()
-
-        # 将摘要作为特殊的 Context Source 注入
-        summary_source = SummaryContextSource(summary)
-        self.system_context.register(summary_source)
-
-        return await self.system_context.initialize()
+    def count_tokens(self, text: str) -> int:
+        return max(1, len(text) // 3)   # 近似
 ```
 
-### 4.2 Summary Context Source
+### 4.3 CompactionBridge（有状态协调器，harness/compaction_bridge.py）
+
+初版设计中 `CompactionEngine.compact(session)` 的编排职责实际由 `CompactionBridge` 承担（Phase 5 引入，此前 CompactionEngine 是死代码）：
 
 ```python
-class SummaryContextSource(ContextSource[SummaryValue]):
-    """摘要上下文源 - 压缩后的结构化摘要"""
+class CompactionBridge:
+    def __init__(self, engine: CompactionEngine, provider: ModelProvider | None): ...
+    # provider 复用既有单一 OpenAIProvider（央企国产-only，不新增适配器）
 
-    key = "session/summary"
+    async def maybe_compact(self, session) -> bool:
+        """
+        触发流程：
+        1. messages = session.log.derive_messages()   # SessionLog 为权威数据源
+        2. total_tokens = 估算（与压缩提示格式对齐的 str/多段 content 处理）
+        3. engine.should_compact(total_tokens) 未过阈值 → False
+        4. 再触发守卫：total_tokens <= _last_compaction_tokens + buffer_tokens → False
+           （deferred surface op 意味着派生历史不会物理收缩，
+            裸阈值检查会每步重复触发；策略保持无状态，守卫状态在桥里）
+        5. engine.build_compaction_prompt(messages, prior_summary=session.summary)
+        6. provider.generate(...) → session.summary = summary
+        7. session._emit(COMPACTION_OCCURRED, {...}, ignorable=True)
+           # 可忽略、不上表面的事件，保持日志可重放/可审计
 
-    def __init__(self, summary: str):
-        self._summary = summary
-
-    async def load(self) -> SummaryValue | Unavailable:
-        if not self._summary:
-            return Unavailable("No summary available")
-        return SummaryValue(summary=self._summary)
-
-    def baseline(self, value: SummaryValue) -> str:
-        return f"## Previous Session Summary\n{value.summary}"
-
-    def update(self, previous: SummaryValue, current: SummaryValue) -> str:
-        return f"Session summary updated with new context."
+        任何失败（engine/provider 为空、无消息、模型调用异常、摘要为空）
+        都返回 False 且**绝不打断当前 turn**。
+        """
 ```
+
+### 4.4 Summary 如何到达模型（reconcile"新可用源"路径）
+
+```
+session.summary 写入
+   ↓ 调用方（SessionRunner）更新 SummaryContextSource.update_summary(summary)
+下一次 turn 的 reconcile：
+   该源在 initialize 时是 Unavailable（摘要为空）→ 不在快照里
+   → reconcile 视其为"新注册的源"，返回 Updated，
+     携带 "## Previous Session Summary\n{summary}"
+   → Phase 4 Inbox 注入路径在 step 边界折叠进模型可见 system context
+```
+
+- **无需基线 replace**：`SystemContextRegistry.replace()` 已实现，但压缩链路当前不走基线替换；物理替换派生历史中段的 `SessionLog.replace(start, end)`（dsh `SurfaceOp.replace`）留待后续阶段。
+- 摘要增量合并：再次压缩时 `build_compaction_prompt` 以旧摘要为 `<prior-summary>`，遵循"对话比旧摘要新，冲突时以对话为准"的合并规则。
 
 ---
 
-## 5. Memory System v2（记忆系统）
+## 5. Memory System v2（实际实现于 memory/ 包）
 
-### 5.1 五层记忆架构（保留初版设计，增强上下文集成）
+### 5.1 分层记忆架构（含实际接线状态）
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
 │                    Five-Layer Memory Architecture                     │
 ├─────────────────────────────────────────────────────────────────────┤
-│                                                                      │
-│   Layer 1: Context Epoch Memory (上下文纪元记忆)                      │
-│   ┌─────────────────────────────────────────────────────────────┐   │
-│   │ - 当前 Epoch 的结构化摘要                                    │   │
-│   │ - 通过 Summary Context Source 注入                           │   │
-│   │ - 每次压缩时自动更新                                         │   │
-│   └─────────────────────────────────────────────────────────────┘   │
-│                                                                      │
-│   Layer 2: Session History (会话历史)                                │
-│   ┌─────────────────────────────────────────────────────────────┐   │
-│   │ - 当前 Epoch 内的完整对话历史                                │   │
-│   │ - JSONL 持久化                                               │   │
-│   │ - 包含 Mid-Conversation System Messages                      │   │
-│   └─────────────────────────────────────────────────────────────┘   │
-│                                                                      │
-│   Layer 3: Workspace Memory (工作区记忆)                             │
-│   ┌─────────────────────────────────────────────────────────────┐   │
-│   │ - 每日摘要 (daily_summary)                                   │   │
-│   │ - 关键决策 (recent_decisions)                                │   │
-│   │ - 重要事实 (key_facts)                                       │   │
-│   │ - 通过 WorkspaceMemoryContextSource 注入                     │   │
-│   └─────────────────────────────────────────────────────────────┘   │
-│                                                                      │
-│   Layer 4: User Memory (用户记忆)                                    │
-│   ┌─────────────────────────────────────────────────────────────┐   │
-│   │ - 用户偏好 (preferences)                                     │   │
-│   │ - 沟通风格 (communication_style)                             │   │
-│   │ - 专业水平 (expertise_level)                                 │   │
-│   │ - 通过 UserPreferencesContextSource 注入                     │   │
-│   └─────────────────────────────────────────────────────────────┘   │
-│                                                                      │
-│   Layer 5: Output Externalization (输出外部化)                       │
-│   ┌─────────────────────────────────────────────────────────────┐   │
-│   │ - 大工具输出存储到文件                                        │   │
-│   │ - 模型可见输出截断                                           │   │
-│   │ - 通过 Tool Definition 的 max_output_chars 控制              │   │
-│   └─────────────────────────────────────────────────────────────┘   │
-│                                                                      │
+│  Layer 1: Context Epoch Memory    → SummaryContextSource 注入        │
+│    （session.summary，压缩时更新；epoch 持久化待接入）                │
+│  Layer 2: Session History         → SessionLog / messages JSONL      │
+│    （含 Mid-Conversation System Messages）                           │
+│  Layer 3: Workspace Memory        → WorkspaceMemoryContextSource     │
+│    （memory/workspace.py 文件存储：daily_summary/recent_decisions/   │
+│     key_facts，上限 50/100 条）                                      │
+│  Layer 4: User Memory             → UserPreferencesContextSource     │
+│    （memory/user.py）                                                │
+│  Layer 5: Output Externalization  → memory/externalize.py            │
+│    （大工具输出落盘 + 模型可见截断，ToolDefinition.max_output_chars） │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
-### 5.2 记忆存储实现
+### 5.2 Workspace Memory（文件存储）
 
 ```python
-class MemoryStore:
-    """
-    记忆存储 - 增强版
+@dataclass
+class WorkspaceMemory:
+    workspace_id: str
+    daily_summary: str | None = None
+    recent_decisions: list[str] = field(default_factory=list)   # 上限 50
+    key_facts: list[str] = field(default_factory=list)          # 上限 100
+    updated_at: datetime
 
-    集成 Context Source 模式，支持:
-    - 自动刷新上下文
-    - 变更检测
-    - 增量更新
-    """
+    def add_decision(self, decision: str) -> None: ...   # 超限截断到最近 N 条
+    def add_fact(self, fact: str) -> None: ...
+    def update_daily_summary(self, summary: str) -> None: ...
 
-    def __init__(self, db: Database):
-        self.db = db
 
-    async def get_workspace_memory(self, workspace_id: str) -> WorkspaceMemory | None:
-        """获取工作区记忆"""
-        row = await self.db.fetch_one(
-            "SELECT * FROM workspace_memory WHERE workspace_id = ?",
-            (workspace_id,),
-        )
-        if not row:
-            return None
-        return WorkspaceMemory(
-            workspace_id=row["workspace_id"],
-            daily_summary=row["daily_summary"],
-            recent_decisions=json.loads(row["recent_decisions"]),
-            key_facts=json.loads(row["key_facts"]),
-        )
+class WorkspaceMemoryStore:
+    """文件存储：<base_path>/workspace/<workspace_id>.json（aiofiles 异步 IO）"""
 
-    async def add_decision(self, workspace_id: str, decision: str):
-        """添加决策记录"""
-        memory = await self.get_workspace_memory(workspace_id)
-        if memory:
-            memory.recent_decisions.append(decision)
-            # 只保留最近 50 条
-            memory.recent_decisions = memory.recent_decisions[-50:]
-            await self._save_workspace_memory(memory)
+    def __init__(self, base_path: Path): ...
+    async def get(self, workspace_id) -> WorkspaceMemory | None: ...
+    async def save(self, memory: WorkspaceMemory) -> None: ...
+    async def delete(self, workspace_id) -> None: ...
+```
 
-    async def add_fact(self, workspace_id: str, fact: str):
-        """添加事实记录"""
-        memory = await self.get_workspace_memory(workspace_id)
-        if memory:
-            memory.key_facts.append(fact)
-            # 只保留最近 100 条
-            memory.key_facts = memory.key_facts[-100:]
-            await self._save_workspace_memory(memory)
+> 与初版差异：初版设计为 SQLite `MemoryStore`（db.fetch_one + workspace_memory 表）；实际为纯文件 JSON 存储，生产环境 SQLite（production/database.py）中预留了表结构（见 Module 05）。
 
-    async def update_daily_summary(self, workspace_id: str, summary: str):
-        """更新每日摘要"""
-        memory = await self.get_workspace_memory(workspace_id)
-        if memory:
-            memory.daily_summary = summary
-            await self._save_workspace_memory(memory)
+### 5.3 Output Externalization（memory/externalize.py）
+
+```python
+class OutputExternalizer:
+    """大工具输出外部化：落盘 tool_outputs/<session_id>/<tool_call_id>.txt，
+    模型可见部分用 truncate_text 截断到 max_chars（默认 2000）"""
+
+    async def externalize(self, session_id, tool_call_id, output,
+                          max_chars=2000) -> ExternalizedOutput: ...
+    async def read_full_output(self, file_path) -> str | None: ...
+    async def cleanup_session(self, session_id) -> None: ...
 ```
 
 ---
 
-## 6. Prompt Assembly v2（提示组装）
+## 6. Prompt Assembly（实际实现：SafeProviderTurnBoundary，见 Module 01 §2.4）
 
-### 6.1 设计理念
+初版的独立 `PromptAssembler` 类未落地；组装职责由 `SafeProviderTurnBoundary.prepare()` 承担：
 
-```python
-class PromptAssembler:
-    """
-    提示组装器 - 增强版
+1. `PromptPromotion.promote()` 推进符合条件的输入
+2. `_settle_tool_results()` 结算已完成的工具结果
+3. `session.drain_injections()` 在 step 边界领取 non-waking 注入（reconcile 更新文本 / 压缩摘要），追加为 `## Context Update` 段
+4. 组装 `(system_context, messages, tools)` → `PreparedTurn`
 
-    不再手动组装，而是通过 System Context Registry 自动组合
-    每个 Context Source 贡献自己的部分
-    """
-
-    def __init__(self, system_context: SystemContextRegistry):
-        self.system_context = system_context
-
-    async def assemble(self, session: Session) -> AssembledPrompt:
-        """
-        组装提示
-
-        1. 协调上下文变更
-        2. 获取 Baseline System Context
-        3. 组装消息历史
-        4. 返回完整的模型调用请求
-        """
-        # 1. 协调上下文
-        snapshot = await session.get_context_snapshot()
-        result = await self.system_context.reconcile(snapshot)
-
-        if result.tag == "Unchanged":
-            system = session.context_epoch.generation.baseline
-        elif result.tag == "Updated":
-            system = session.context_epoch.generation.baseline
-            await session.update_context_snapshot(result.snapshot)
-        elif result.tag == "ReplacementReady":
-            await session.start_new_epoch(result.generation)
-            system = result.generation.baseline
-        elif result.tag == "ReplacementBlocked":
-            raise ContextUnavailableError(result.unavailable_keys)
-
-        # 2. 获取消息历史
-        messages = await session.get_history()
-
-        return AssembledPrompt(
-            system=system,
-            messages=messages,
-            context_snapshot=await session.get_context_snapshot(),
-        )
-
-@dataclass
-class AssembledPrompt:
-    """组装后的提示"""
-    system: str
-    messages: list[Message]
-    context_snapshot: Snapshot
-```
+上下文协调（reconcile）与压缩压力检查由 `SessionRunner.run()` 每步内嵌执行（Phase 4/5），对所有客户端入口一致生效。
 
 ---
 
-## 7. 数据模型
+## 7. 数据模型（实际定义位置）
 
 ```python
-@dataclass
-class Generation:
-    """上下文生成"""
-    baseline: str
-    snapshot: Snapshot
-
-@dataclass
-class Snapshot:
-    """上下文快照"""
-    entries: dict[str, SourceSnapshot]
-
+# context/registry.py
 @dataclass
 class SourceSnapshot:
-    """单个源的快照"""
     value: Any
     removed: str | None = None
 
-class ReconcileResult:
-    """协调结果"""
-    pass
+@dataclass
+class Snapshot:
+    entries: dict[str, SourceSnapshot] = field(default_factory=dict)
 
 @dataclass
-class Unchanged(ReconcileResult):
-    tag: str = "Unchanged"
+class Generation:
+    baseline: str
+    snapshot: Snapshot
 
+# 协调结果（ReconcileResult 子类）
+@dataclass
+class Unchanged(ReconcileResult): tag: str = "Unchanged"
 @dataclass
 class Updated(ReconcileResult):
-    text: str
-    snapshot: Snapshot
+    text: str = ""
+    snapshot: Snapshot = field(default_factory=Snapshot)
     tag: str = "Updated"
-
 @dataclass
-class ReplacementResult:
-    """替换结果"""
-    pass
-
-@dataclass
-class ReplacementReady(ReplacementResult):
-    generation: Generation
+class ReplacementReady(ReconcileResult):
+    generation: Generation = ...
     tag: str = "ReplacementReady"
-
 @dataclass
-class ReplacementBlocked(ReplacementResult):
+class ReplacementBlocked(ReconcileResult):
     unavailable_keys: list[str] = field(default_factory=list)
     tag: str = "ReplacementBlocked"
 
+# 替换结果（ReplacementResult 子类）：ReplacementReadyRep / ReplacementBlockedRep
+
+# context/epoch.py
+@dataclass
+class ContextEpoch:
+    id: str                    # generate_id()
+    generation: Generation
+    started_at: datetime
+    ended_at: datetime | None = None
+    end_reason: str | None = None
+    # initial() / is_active / end(reason) / baseline / snapshot
+
+# context/compaction.py
+@dataclass
+class CompactionConfig:
+    enabled: bool = True
+    max_tokens: int = 100000
+    buffer_tokens: int = 20000
+    keep_tokens: int = 8000
+
 @dataclass
 class CompactionResult:
-    """压缩结果"""
     epoch_id: str
     summary: str
     tokens_before: int
     tokens_after: int
 
-@dataclass
-class AssembledPrompt:
-    """组装后的提示"""
-    system: str
-    messages: list[Message]
-    context_snapshot: Snapshot
-
-# Context Source 值类型
-@dataclass
-class DateValue:
-    date: str
-    time: str
-    timezone: str
-    weekday: str
-
-@dataclass
-class InstructionsValue:
-    instructions: list[Instruction]
-
-@dataclass
-class Instruction:
-    source: str
-    content: str
-
-@dataclass
-class SkillsValue:
-    skills: list[SkillInfo]
-
-@dataclass
-class MemoryValue:
-    daily_summary: str | None
-    recent_decisions: list[str]
-    key_facts: list[str]
-
-@dataclass
-class PreferencesValue:
-    language: str
-    style: str
-    expertise: str
-
-@dataclass
-class SummaryValue:
-    summary: str
+# context/source.py 值类型
+DateValue(date, time, timezone, weekday)
+Instruction(source, content) / InstructionsValue(instructions)
+SkillInfo(name, description, slash=False) / SkillsValue(skills)
+MemoryValue(daily_summary, recent_decisions, key_facts)
+PreferencesValue(language, style, expertise)
+SummaryValue(summary)
+AgentValue(name, mode, skills_count)
 ```
 
 ---
@@ -922,26 +427,27 @@ class SummaryValue:
 
 | 接口 | 方向 | 说明 |
 |------|------|------|
-| `SystemContextRegistry` | 核心 | 上下文管理 |
+| `SystemContextRegistry` | 核心 | 上下文管理（SessionRunner.system_context 注入） |
 | `ContextSource` | 扩展 | 自定义上下文源 |
-| `CompactionEngine` | 输出 | 压缩触发 |
-| `MemoryStore` | 依赖 | 记忆持久化 |
-| `SessionStore` | 依赖 | 会话持久化 |
-| `ModelProvider` | 依赖 | 摘要生成 |
+| `CompactionBridge` | 输出 | 压缩触发（SessionRunner.compaction_bridge 注入） |
+| `SummaryContextSource` | 内部 | 摘要注入点（SessionRunner.summary_source 注入） |
+| `WorkspaceMemoryStore` | 依赖 | 记忆持久化（文件 JSON） |
+| `OutputExternalizer` | 依赖 | 工具输出外部化 |
+| `ModelProvider` | 依赖 | 摘要生成（复用单一 OpenAIProvider） |
 
 ---
 
 ## 9. 实现计划
 
-| 阶段 | 内容 | 产出 |
+| 阶段 | 内容 | 状态 |
 |------|------|------|
-| Phase 1 | Context Source 基础接口 | 可注册的上下文源 |
-| Phase 2 | System Context Registry | 上下文组合与协调 |
-| Phase 3 | 内置 Context Sources | 日期/项目/技能/记忆/偏好 |
-| Phase 4 | Mid-Conversation System Message | 对话中状态变更 |
-| Phase 5 | Structured Compaction | 高质量压缩 |
-| Phase 6 | Memory Store 集成 | 五层记忆系统 |
+| Phase 1 | Context Source 基础接口 | ✅ 已完成（context/source.py，7 个内置源） |
+| Phase 2 | System Context Registry | ✅ 已完成（context/registry.py） |
+| Phase 3 | Context Epoch / Snapshot 类型 | ✅ 已完成（epoch 持久化触发待接入） |
+| Phase 4 | Mid-Conversation 更新 + Inbox 注入路径 | ✅ 已完成（midconv.py + SessionRunner Phase 4） |
+| Phase 5 | Structured Compaction + Bridge | ✅ 已完成（compaction.py + compaction_bridge.py；surface op replace 留后续） |
+| Phase 6 | Memory Store / Externalization | ✅ 已完成（memory/ 包）；WorkspaceMemoryContextSource 与存储的自动同步待接线 |
 
 ---
 
-*文档版本: v2.0 | 创建日期: 2026-08-27 | 基于 opencode 架构优化*
+*文档版本: v2.1 | 创建日期: 2026-08-27 | 最近更新: 2026-09-03 | 基于 opencode 架构优化*

@@ -1,5 +1,11 @@
 # Module 01: Agent Core v2 — 智能体核心引擎（opencode 增强版）
 
+> **v2.1 实现对齐说明（2026-09-03）**：本节已按实际代码更新。要点变更：
+> - Provider-Turn Boundary 未单独成文件，`SafeProviderTurnBoundary` 实现于 [drain.py](file:///f:/MyCoding/sdpost-claw/src/sdpost_claw/agent/drain.py)
+> - 执行循环由 `harness/` 的 `SessionDriver`（turn/step 状态机）驱动，工具执行走 `harness/tool_pipeline.py` 三阶段管道
+> - 工具输入 Schema 采用 JSON Schema dict（非 Pydantic），实际内置工具为 8 个（无 websearch/task/skill）
+> - 权限评估策略为"最高优先级匹配，同优先级最后匹配生效"
+
 ## 1. 设计演进说明
 
 本模块在初版设计基础上，吸收了 opencode 的以下优秀设计：
@@ -10,6 +16,8 @@
 | 基础 Tool Dispatch | Schema-validated Tool Definition | 类型安全的工具输入/输出验证 |
 | 简单权限检查 | Wildcard Permission Ruleset | 灵活的模式匹配权限 |
 | 基础压缩 | Structured Compaction Template | 高质量的结构化摘要 |
+
+实现阶段又吸收了 **deepseek-harness (dsh)** 的执行骨架设计（turn/step 状态机、Inbox、append-only SessionLog、三阶段 Tool Pipeline），见 §2.3。
 
 ---
 
@@ -46,74 +54,98 @@
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
-### 2.2 Safe Provider-Turn Boundary（安全模型调用边界）
+### 2.2 Safe Provider-Turn Boundary（安全模型调用边界 — 实际实现）
+
+实现于 [drain.py](file:///f:/MyCoding/sdpost-claw/src/sdpost_claw/agent/drain.py) `SafeProviderTurnBoundary`。在每次模型调用前：
+
+1. **Prompt Promotion**：`PromptPromotion.promote()` 从 `session.inbox` 领取（drain）`next_turn` 队列中的用户输入，写入 `session.history` 并镜像写入 append-only 事件日志（`user_message` 事件）
+2. **Tool Result Settlement**：将 `session.pending_tool_results` 结算进 history（`role=tool`）并写入 `tool_result` 表面事件
+3. **Non-waking Inject**：调用 `session.drain_injections()` 领取 `next_step` 队列的上下文注入，记录为 ignorable `context_injection` 事件，并把文本以 `## Context Update` 补丁折叠进本次模型可见的 system context（不产生额外 user turn）
+4. **组装**：返回 `PreparedTurn`（system_context / messages / tools / admitted / settled），`has_work()` 判断是否有工作可做
 
 ```python
 class SafeProviderTurnBoundary:
-    """
-    安全模型调用边界 - 借鉴 opencode 设计
+    """安全模型调用边界 - 实现于 agent/drain.py"""
 
-    在每次模型调用之前，确保：
-    1. 所有符合条件的用户输入已推进到 Session History
-    2. 所有已完成的工具结果已结算
-    3. 上下文变更可以安全地按时间顺序纳入
-    4. 不会在模型调用过程中异步推送上下文变更
-    """
+    def __init__(self, session: "Session"):
+        self.session = session
 
     async def prepare(
         self,
-        session: Session,
-        system_context: SystemContext,
+        system_context: str,
+        tools: list[ToolDefinition],
     ) -> PreparedTurn:
-        """准备一次安全的模型调用"""
-
-        # 1. 推进符合条件的用户输入
-        admitted = await self._promote_pending_input(session)
+        # 1. 推进符合条件的输入（从 Inbox next_turn 领取）
+        promotion = PromptPromotion(self.session)
+        admitted = await promotion.promote()
 
         # 2. 结算已完成的工具结果
-        settled = await self._settle_tool_results(session)
+        settled = await self._settle_tool_results()
 
-        # 3. 在安全边界纳入上下文变更
-        context_update = await self._reconcile_context(session, system_context)
+        # 3. 在 step 边界领取上下文注入（non-waking inject），
+        #    折叠为 "## Context Update" 补丁
+        injections = self.session.drain_injections()
+        if injections:
+            patch = "\n\n## Context Update\n" + "\n\n".join(
+                inj.text for inj in injections
+            )
+            system_context = system_context + patch
 
-        # 4. 组装最终的模型调用请求
+        # 4. 组装 messages / tools
         return PreparedTurn(
-            system_context=system_context.baseline,
-            messages=await self._assemble_history(session),
-            tools=await self._get_available_tools(session),
-            context_update=context_update,  # Mid-Conversation System Message
+            system_context=system_context,
+            messages=list(self.session.history),
+            tools=[t.to_dict() for t in tools],
             admitted=admitted,
             settled=settled,
         )
-
-    async def _reconcile_context(
-        self,
-        session: Session,
-        system_context: SystemContext,
-    ) -> MidConversationSystemMessage | None:
-        """
-        协调上下文变更 - 借鉴 opencode 的 Context Reconciliation
-
-        返回以下之一：
-        - Unchanged: 上下文无变化
-        - Updated: 有更新，生成 Mid-Conversation System Message
-        - ReplacementReady: 需要替换基线（如压缩后）
-        - ReplacementBlocked: 替换被阻塞（有不可用上下文）
-        """
-        snapshot = await session.get_context_snapshot()
-        result = await system_context.reconcile(snapshot)
-
-        if result.tag == "Unchanged":
-            return None
-        elif result.tag == "Updated":
-            return MidConversationSystemMessage(text=result.text)
-        elif result.tag == "ReplacementReady":
-            await session.replace_baseline(result.generation)
-            return None
-        elif result.tag == "ReplacementBlocked":
-            # 有不可用的上下文源，阻塞本次调用
-            raise ContextUnavailableError(result.unavailable_keys)
 ```
+
+### 2.3 Harness 执行骨架（v2.1 新增，借鉴 deepseek-harness）
+
+实现层新增 `harness/` 包，为 Session Drain 提供执行骨架。`SessionRunner.run()` 仍是唯一的每步执行器（签名不变），harness 只负责生命周期与策略：
+
+| 组件 | 文件 | 职责 |
+|------|------|------|
+| `SessionDriver` | [harness/driver.py](file:///f:/MyCoding/sdpost-claw/src/sdpost_claw/harness/driver.py) | turn/step 状态机。**turn** = 0..n 个 step，以 `turn_start`/`turn_end`（带结构化 reason：completed/blocked/aborted/error/max_tokens/interrupted/max_steps）为界；**step** = 一次模型请求 + 其工具调用。`pre_turn`/`pre_step` 钩子是软停止检查点（deny-only，首个 Abort 生效），取代硬编码 max_iterations 作为主控（旧上限仅作安全兜底） |
+| `Inbox` | [harness/inbox.py](file:///f:/MyCoding/sdpost-claw/src/sdpost_claw/harness/inbox.py) | 双队列输入：`next_turn`（用户 prompt，开新 turn）+ `next_step`（`Inject`：context_update/skill/file_change 等，在下一个 step 边界合并且**不唤醒**驱动）。`claim_next_turn`/`claim_next_step` 为领取式（drain），保证每条恰好合并一次 |
+| `SessionLog` | [harness/session_log.py](file:///f:/MyCoding/sdpost-claw/src/sdpost_claw/harness/session_log.py) | append-only 事件日志，`append()` 是唯一写入口（快照数据 + 单调 seq）。`derive_messages()` 从表面事件（`user_message`/`assistant_message`/`tool_result`，见 `SURFACE_TYPES`）投影出 OpenAI 格式消息历史——"模型可见即已记录"。支持增量持久化 JSONL（水位线 `_persisted_seq`） |
+| 事件词表 | [harness/events.py](file:///f:/MyCoding/sdpost-claw/src/sdpost_claw/harness/events.py) | `turn_start/end`、`step_start/end`、`user_message`、`assistant_message`、`tool_call`、`tool_result`、`request_header`、`session_end`、`compaction_occurred`、`context_injection`；`SessionEvent` 带 `seq`/`time`/`ignorable`（未知 ignorable 事件可被读者跳过） |
+| 三阶段工具管道 | [harness/tool_pipeline.py](file:///f:/MyCoding/sdpost-claw/src/sdpost_claw/harness/tool_pipeline.py) | `run()`：① pre-execute（PermissionRuleset 决策 + deny-only 单调 guards，ask 在自动化模式自动拒绝）→ ② execute（around 钩子接缝，预留 timeout/retry/audit）→ ③ post-execute（PostGuard 可 accept/block/replace）+ 工具可选 `finalize_content` 同步内容重写。每次调用 emit 一条 ignorable `tool_call` 观察事件（含结构化 pre-decision，作为审计记录） |
+| `CompactionBridge` | [harness/compaction_bridge.py](file:///f:/MyCoding/sdpost-claw/src/sdpost_claw/harness/compaction_bridge.py) | 无状态 `CompactionEngine`（策略）与驱动循环之间的有状态协调器，见 §6 |
+
+应用层 agent loop（[main.py](file:///f:/MyCoding/sdpost-claw/src/sdpost_claw/main.py) `Application._process_input`）驱动顺序：
+`turn_start` → [`step_start`（pre_step 钩子软停止）→ `SessionRunner.run()` → `step_end`]×n → `turn_end`（finally 中恰好一次）→ `SessionManager.persist_log()` 落盘事件日志。
+
+### 2.4 SessionRunner（实际实现）
+
+```python
+class SessionRunner:
+    """执行一次 Session Drain - agent/drain.py"""
+
+    def __init__(self, tool_registry, permission_ruleset,
+                 model_provider=None, event_bus=None):
+        ...  # Phase 4/5 协调器在构造后注入：
+             # system_context / compaction_bridge / summary_source
+
+    async def run(self, session, system_context, force=False, on_delta=None) -> DrainResult:
+        # 1. 每步 reconcile 上下文快照（Phase 4）：Updated 结果路由进
+        #    session.inbox（context_update 注入），本步边界即折叠进
+        #    system context —— 无 baseline 补丁、无额外 user turn。
+        #    快照在首个 step 惰性初始化，sidecar/desktop 同样生效。
+        # 2. SafeProviderTurnBoundary.prepare()
+        # 3. force=False 且无工作 → DrainResult(status="no_work")
+        # 4. 压缩压力检查（Phase 5）：CompactionBridge.maybe_compact()，
+        #    命中后 summary_source.update_summary(session.summary)
+        # 5. 调用模型（on_delta 回调支持流式 text/reasoning）
+        # 6. has_tool_calls → _execute_tools()（走三阶段管道）→
+        #    status="tool_execution"；否则 assistant 文本入 history +
+        #    assistant_message 事件 → status="text_response"
+```
+
+`DrainResult.status`：`no_work | tool_execution | text_response | error`（error 携带 `error` 字段）。
+
+工具权限推断（`_infer_permission`）：`read/glob/grep→file.read`、`write→file.write`、`edit→file.edit`、`bash→shell.execute`、`webfetch→network.request`、`question→user.interact`，未知工具回退 `tool.<name>`。
 
 ---
 
@@ -252,25 +284,27 @@ class ProjectInstructionsContextSource(ContextSource[InstructionsValue]):
         return f"Project instructions updated. {len(current.instructions)} instruction files active."
 
 class AgentSkillsContextSource(ContextSource[SkillsValue]):
-    """Agent 可用技能上下文源"""
+    """Agent 可用技能上下文源 - 实现于 context/source.py"""
 
-    key = "agent/skills"
+    def __init__(self, skills: list[SkillInfo] | None = None):
+        # 实际实现直接持有技能列表（setup 时从 SkillRegistry.discover
+        # 一次性灌入）；按 Agent 权限的动态刷新为后续计划
+        self._skills = skills or []
 
-    def __init__(self, agent: Agent, skill_registry: SkillRegistry):
-        self.agent = agent
-        self.registry = skill_registry
+    @property
+    def key(self) -> str:
+        return "agent/skills"
 
     async def load(self) -> SkillsValue | Unavailable:
-        # 只列出该 Agent 有权使用的技能名称和描述
-        available = self.registry.get_available_for_agent(self.agent.id)
-        if not available:
+        if not self._skills:
             return Unavailable("No skills available")
-        return SkillsValue(skills=available)
+        return SkillsValue(skills=self._skills)
 
     def baseline(self, value: SkillsValue) -> str:
-        parts = ["## Available Skills\n"]
+        parts = ["## Available Skills"]
         for skill in value.skills:
-            parts.append(f"- **{skill.name}**: {skill.description}")
+            slash = f"/" if skill.slash else ""
+            parts.append(f"- **{slash}{skill.name}**: {skill.description or 'No description'}")
         return "\n".join(parts)
 ```
 
@@ -303,28 +337,29 @@ class SystemContextRegistry:
 
     async def initialize(self) -> Generation:
         """
-        初始化 System Context
-        生成基线和快照
+        初始化 System Context（实际实现）
+
+        生成基线和快照。**Unavailable 的源被跳过**（不贡献基线也不进快照），
+        而不是抛 InitializationBlocked —— 否则任何可选源（如项目指令文件）
+        缺失都会让整个上下文系统回退。InitializationBlocked 异常类仍保留
+        但当前初始化路径不使用。
         """
         baseline_parts = []
-        snapshot = {}
+        snapshot = Snapshot()
 
         for key in self._order:
             source = self._sources[key]
             value = await source.load()
 
             if isinstance(value, Unavailable):
-                raise InitializationBlocked(unavailable_keys=[key])
+                continue  # 跳过，不贡献基线
 
             baseline_parts.append(source.baseline(value))
-            snapshot[key] = SourceSnapshot(
-                value=value,
-                removed=None,
-            )
+            snapshot.entries[key] = SourceSnapshot(value=value)
 
         return Generation(
             baseline="\n\n".join(baseline_parts),
-            snapshot=Snapshot(entries=snapshot),
+            snapshot=snapshot,
         )
 
     async def reconcile(
@@ -332,13 +367,16 @@ class SystemContextRegistry:
         snapshot: Snapshot,
     ) -> ReconcileResult:
         """
-        协调上下文 - 比较当前值与快照
+        协调上下文 - 比较当前值与快照（实际实现）
 
-        返回:
+        实际实现只返回两种结果：
         - Unchanged: 无变化
-        - Updated: 有更新
-        - ReplacementReady: 需要替换基线
-        - ReplacementBlocked: 替换被阻塞
+        - Updated: 有更新（新注册源贡献 baseline 文本；已变更源贡献
+          update 文本），携带合并后的新快照
+
+        ReplacementReady / ReplacementBlocked 结果类型已定义但当前
+        reconcile 不返回（replace() 路径使用独立的 ReplacementResult
+        体系，见 Module 03）。
         """
         updates = []
         new_snapshot = {}
@@ -382,192 +420,103 @@ class SystemContextRegistry:
 
 ## 4. Tool System v2（类型安全工具）
 
-### 4.1 设计理念（借鉴 opencode）
+### 4.1 设计理念（借鉴 opencode — 实际实现）
+
+实际实现（[agent/tools.py](file:///f:/MyCoding/sdpost-claw/src/sdpost_claw/agent/tools.py)）与初版设计的差异：
+
+- 输入 Schema 使用 **JSON Schema dict**（OpenAI function calling 格式直接可用），而非 Pydantic model
+- **没有独立的输出 Schema 验证**；输出经 `str()` 后做大小截断（`truncate_text` 保留头尾）
+- 新增 `finalize_content` 回调：同步、仅内容的重写，在管道所有归一化（截断）完成后执行一次（dsh `finalizeContent`）
+- `to_dict()` 直接产出 OpenAI 兼容的 tool dict
 
 ```python
-class ToolDefinition(Generic[Input, Output]):
-    """
-    工具定义 - 借鉴 opencode 的 type-safe tool design
+@dataclass
+class ToolDefinition:
+    """工具定义 - 类型安全工具（实际实现）"""
 
-    特性:
-    - 输入/输出 Schema 验证
-    - 结构化输出与模型可见输出分离
-    - 权限集成
-    - 输出大小限制
-    """
-
-    def __init__(
-        self,
-        name: str,
-        description: str,
-        input_schema: Type[Input],  # Pydantic model
-        output_schema: Type[Output],
-        structured_schema: Type[StructuredOutput] | None = None,
-        execute: Callable[[Input, ToolContext], Awaitable[Output]] = None,
-        permission: str | None = None,
-        max_output_chars: int = 2000,
-    ):
-        self.name = name
-        self.description = description
-        self.input_schema = input_schema
-        self.output_schema = output_schema
-        self.structured_schema = structured_schema or output_schema
-        self.execute_fn = execute
-        self.permission = permission
-        self.max_output_chars = max_output_chars
+    name: str
+    description: str
+    input_schema: dict[str, Any]  # JSON Schema
+    execute_fn: Callable[[dict, ToolContext], Awaitable[Any]]
+    permission: str | None = None
+    max_output_chars: int = 2000
+    # 可选的同步内容重写，由工具管道在截断之后执行（默认 None，向后兼容）
+    finalize_content: Callable[[str], str] | None = None
 
     async def execute(self, input_data: dict, context: ToolContext) -> ToolResult:
-        """执行工具"""
-        # 1. 验证输入
-        validated = self.input_schema(**input_data)
+        """执行工具（计时 + 异常统一封装为 is_error 的 ToolResult）"""
+        output = await self.execute_fn(input_data, context)
+        model_output = self._format_for_model(output)  # 大小限制 + 截断
+        return ToolResult(...)
 
-        # 2. 执行
-        output = await self.execute_fn(validated, context)
-
-        # 3. 验证输出
-        validated_output = self.output_schema(**output) if isinstance(output, dict) else output
-
-        # 4. 生成模型可见输出（可能截断）
-        model_output = self._format_for_model(validated_output)
-
-        # 5. 生成结构化输出（完整）
-        structured = None
-        if self.structured_schema != self.output_schema:
-            structured = self._to_structured(validated_output)
-
-        return ToolResult(
-            tool_call_id=context.tool_call_id,
-            name=self.name,
-            content=model_output.text,
-            structured_output=structured,
-            externalized_path=model_output.externalized_path,
-            is_truncated=model_output.is_truncated,
-        )
-
-    def _format_for_model(self, output: Output) -> ModelOutput:
-        """格式化为模型可见输出，带大小限制"""
-        text = str(output)
-        if len(text) <= self.max_output_chars:
-            return ModelOutput(text=text, is_truncated=False)
-
-        # 截断：保留头尾
-        head_chars = self.max_output_chars // 2 - 100
-        tail_chars = self.max_output_chars // 2 - 100
-        truncated = text[:head_chars] + "\n... (truncated) ...\n" + text[-tail_chars:]
-
-        # 完整输出外部化
-        externalized_path = await self._save_full_output(text)
-
-        return ModelOutput(
-            text=truncated,
-            externalized_path=externalized_path,
-            is_truncated=True,
-        )
+    def to_dict(self) -> dict:
+        """OpenAI 兼容工具 dict"""
+        return {
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": self.description,
+                "parameters": self.input_schema,
+            },
+        }
 ```
 
-### 4.2 内置工具集（借鉴 opencode 的工具分类）
+`ToolResult` 字段：`tool_call_id / name / content / structured_output / externalized_path / is_truncated / is_error / duration_ms`。`ToolContext` 字段：`session_id / agent_id / assistant_message_id / tool_call_id / cwd / max_output_chars`。
+
+### 4.2 内置工具集（实际实现：8 个工具）
+
+实际实现于 [agent/tools.py](file:///f:/MyCoding/sdpost-claw/src/sdpost_claw/agent/tools.py) `BuiltInTools.register_all(registry, cwd)`：
 
 ```python
 class BuiltInTools:
-    """内置工具集 - 参考 opencode 的工具分类"""
+    """内置工具集 - 实际注册的 8 个工具"""
 
     @staticmethod
-    def register_all(registry: ToolRegistry):
+    def register_all(registry: ToolRegistry, cwd: str = "") -> None:
         # === 文件操作 ===
         registry.register(ToolDefinition(
-            name="read",
-            description="Read file contents",
-            input_schema=ReadInput,
-            output_schema=ReadOutput,
+            name="read",      # 读取文件（offset/limit 分页，带行号）
             permission="file.read",
         ))
-
         registry.register(ToolDefinition(
-            name="write",
-            description="Write file contents",
-            input_schema=WriteInput,
-            output_schema=WriteOutput,
+            name="write",     # 写文件（自动创建父目录）
             permission="file.write",
         ))
-
         registry.register(ToolDefinition(
-            name="edit",
-            description="Edit file with exact string replacement",
-            input_schema=EditInput,
-            output_schema=EditOutput,
+            name="edit",      # 精确字符串替换（仅第一处）
             permission="file.edit",
         ))
-
         registry.register(ToolDefinition(
-            name="glob",
-            description="Find files by glob pattern",
-            input_schema=GlobInput,
-            output_schema=GlobOutput,
+            name="glob",      # glob 模式找文件
             permission="file.read",
         ))
-
         registry.register(ToolDefinition(
-            name="grep",
-            description="Search file contents with regex",
-            input_schema=GrepInput,
-            output_schema=GrepOutput,
+            name="grep",      # regex 搜内容（结果限 100 条）
             permission="file.read",
         ))
 
         # === Shell 执行 ===
         registry.register(ToolDefinition(
-            name="bash",
-            description="Execute shell command",
-            input_schema=BashInput,
-            output_schema=BashOutput,
+            name="bash",      # shell 命令（默认 timeout 60s）
             permission="shell.execute",
             max_output_chars=4000,
         ))
 
         # === 网络请求 ===
         registry.register(ToolDefinition(
-            name="webfetch",
-            description="Fetch web content",
-            input_schema=WebfetchInput,
-            output_schema=WebfetchOutput,
+            name="webfetch",  # 抓取网页（默认 max_chars 5000）
             permission="network.request",
-        ))
-
-        registry.register(ToolDefinition(
-            name="websearch",
-            description="Search the web",
-            input_schema=WebsearchInput,
-            output_schema=WebsearchOutput,
-            permission="network.search",
-        ))
-
-        # === 子 Agent ===
-        registry.register(ToolDefinition(
-            name="task",
-            description="Spawn a sub-agent for complex tasks",
-            input_schema=TaskInput,
-            output_schema=TaskOutput,
-            permission="agent.spawn",
+            max_output_chars=8000,
         ))
 
         # === 用户交互 ===
         registry.register(ToolDefinition(
-            name="question",
-            description="Ask the user a question",
-            input_schema=QuestionInput,
-            output_schema=QuestionOutput,
+            name="question",  # 向用户提问（由 UI 层特殊处理）
             permission="user.interact",
         ))
-
-        # === 技能系统 ===
-        registry.register(ToolDefinition(
-            name="skill",
-            description="Execute a skill",
-            input_schema=SkillInput,
-            output_schema=SkillOutput,
-            permission="skill.execute",
-        ))
 ```
+
+> **未实现的规划工具**：`websearch`（网络搜索）、`task`（子 Agent 派生）、`skill`（技能执行）仍在设计中，代码尚未注册。相关权限动作（`network.search`、`agent.spawn`、`skill.execute`）已预留于权限体系。
 
 ---
 
@@ -617,46 +566,59 @@ class PermissionRuleset:
 
     def evaluate(self, action: str) -> PermissionDecision:
         """
-        评估权限 - 最后匹配的规则生效（Last Match Wins）
-        借鉴 opencode 的 findLast 策略
+        评估权限（实际实现于 agent/permissions.py）
+
+        策略：**最高优先级的匹配规则生效；同优先级时最后匹配的规则生效**
+        （opencode findLast 策略 + 优先级扩展）。
         """
         matching = [r for r in self._rules if r.matches(action)]
         if not matching:
-            return PermissionDecision(
-                effect="ask",  # 无规则时询问用户
-                rule=None,
-            )
+            return PermissionDecision(effect="ask", rule=None)  # 无规则 → ask
 
-        # 按优先级排序，返回最高优先级的规则
-        matching.sort(key=lambda r: r.priority, reverse=True)
+        # 按 (priority, 规则位置) 降序排序 → 最高优先级、位置最靠后者胜出
+        matching.sort(key=lambda r: (r.priority, self._rules.index(r)), reverse=True)
         winner = matching[0]
 
-        return PermissionDecision(
-            effect=winner.effect,
-            rule=winner,
-        )
+        return PermissionDecision(effect=winner.effect, rule=winner)
+
+    def is_allowed(self, action: str) -> bool: ...
+    def is_denied(self, action: str) -> bool: ...
+    def remove_rule(self, action, effect=None) -> None: ...  # 规则移除
+```
+
+通配符实现细节：`PermissionRule.__post_init__` 对 action 做 `re.escape` 后再把 `\*` 还原为 `.*`，因此 `file.*`、`shell.*`、`*` 等模式中的 `.` 等元字符不会被误当通配符。
+
+> **自动化模式的 ask 处理**：三阶段工具管道（harness/tool_pipeline.py）中，`ask` 决策在无人工介入的自动化执行路径上**自动拒绝**（`permission requires confirmation (auto-denied)`），与既有行为保持一致。
 
 class AgentPermissions:
-    """Agent 权限配置 - 借鉴 opencode 的 build/plan 模式"""
+    """Agent 权限预设 - 实际实现（build/plan/general）"""
 
     @staticmethod
     def build() -> PermissionRuleset:
         """build agent - 完全访问权限"""
         ruleset = PermissionRuleset()
-        ruleset.allow("*")  # 允许所有
+        ruleset.allow("*")
         return ruleset
 
     @staticmethod
     def plan() -> PermissionRuleset:
         """plan agent - 只读权限"""
         ruleset = PermissionRuleset()
-        ruleset.allow("file.read.*")
-        ruleset.allow("file.list.*")
-        ruleset.allow("network.*")
-        ruleset.deny("file.write.*")
-        ruleset.deny("file.edit.*")
-        ruleset.deny("shell.*")
-        ruleset.deny("agent.spawn")
+        ruleset.allow("file.read", priority=5)
+        ruleset.allow("file.list", priority=5)
+        ruleset.allow("network.*", priority=5)
+        ruleset.deny("file.write", priority=10)
+        ruleset.deny("file.edit", priority=10)
+        ruleset.deny("shell.*", priority=10)
+        ruleset.deny("agent.spawn", priority=10)
+        return ruleset
+
+    @staticmethod
+    def general() -> PermissionRuleset:
+        """general agent - 标准访问，拒绝危险 shell 操作"""
+        ruleset = PermissionRuleset()
+        ruleset.allow("*", priority=5)
+        ruleset.deny("shell.rm", priority=10)
         return ruleset
 
     @staticmethod
@@ -669,6 +631,8 @@ class AgentPermissions:
             ruleset.allow(action, priority=5)
         return ruleset
 ```
+
+模式切换实际生效路径：终端 REPL 的 `mode <build|plan|general>` 命令会**重建 PermissionRuleset 并热替换** `SessionRunner.permission_ruleset`（见 main.py `_ruleset_for_mode`），保证模式切换即时生效。
 
 ---
 
@@ -719,57 +683,59 @@ When combining:
 - If a blocker has been resolved, update the summary to reflect that while keeping any details still needed to continue the work.
 - Update "Objective" and "Next Move" to reflect the current work state."""
 
+### 6.2 实际实现：无状态 CompactionEngine + 有状态 CompactionBridge
+
+实际实现将"策略"与"协调"分离（[context/compaction.py](file:///f:/MyCoding/sdpost-claw/src/sdpost_claw/context/compaction.py) + [harness/compaction_bridge.py](file:///f:/MyCoding/sdpost-claw/src/sdpost_claw/harness/compaction_bridge.py)）：
+
+```python
 class CompactionEngine:
-    """压缩引擎 - 借鉴 opencode 的结构化压缩"""
+    """压缩引擎 - 无状态策略（context/compaction.py）"""
 
     def __init__(self, config: CompactionConfig):
         self.config = config
         self.buffer_tokens = config.buffer_tokens  # 默认 20000
         self.keep_tokens = config.keep_tokens      # 默认 8000
 
-    async def should_compact(self, session: Session) -> bool:
-        """判断是否需要压缩"""
-        total_tokens = await session.count_tokens()
+    def should_compact(self, total_tokens: int) -> bool:
+        """total_tokens > max_tokens - buffer_tokens 时触发"""
+        if not self.config.enabled:
+            return False
         return total_tokens > (self.config.max_tokens - self.buffer_tokens)
 
-    async def compact(self, session: Session) -> CompactionResult:
-        """
-        执行压缩
-        1. 获取当前完整历史
-        2. 生成结构化摘要
-        3. 创建新的 Context Epoch
-        4. 保留摘要作为新的基线
-        """
-        history = await session.get_full_history()
+    def build_compaction_prompt(
+        self, messages: list[dict], prior_summary: str | None = None,
+    ) -> tuple[str, str]:
+        """返回 (system_prompt, user_content)。
+        有 prior_summary 时走增量模板（TEMPLATE + UPDATE_INSTRUCTIONS，
+        <prior-summary> + <conversation> 包裹）；否则走首次压缩模板。"""
 
-        # 生成结构化摘要
-        summary = await self._generate_summary(history)
-
-        # 创建新的 Context Epoch
-        new_epoch = await session.start_new_epoch()
-
-        # 保留摘要
-        await session.set_baseline_summary(summary)
-
-        return CompactionResult(
-            epoch_id=new_epoch.id,
-            summary=summary,
-            tokens_before=sum(m.tokens for m in history),
-            tokens_after=self._count_tokens(summary),
-        )
-
-    async def _generate_summary(self, history: list[Message]) -> str:
-        """生成结构化摘要"""
-        # 使用轻量模型生成摘要
-        response = await self.model.generate(
-            system=COMPACTION_TEMPLATE,
-            messages=[{
-                "role": "user",
-                "content": self._format_history_for_compaction(history),
-            }],
-        )
-        return response.text
+    def count_tokens(self, text: str) -> int:
+        """近似 token 估算：len(text) // 3"""
 ```
+
+```python
+class CompactionBridge:
+    """有状态协调器 - 连接 CompactionEngine 与驱动循环（harness/compaction_bridge.py）"""
+
+    def __init__(self, engine, provider=None):
+        self.engine = engine
+        self.provider = provider            # 复用现有单一 provider（央企国产-only）
+        self._last_compaction_tokens = 0    # 重触发保护状态
+
+    async def maybe_compact(self, session) -> bool:
+        """每步压力检查（在 SessionRunner.run 内调用，位于边界 prepare 之后、
+        模型调用之前）：
+        1. 从 SessionLog.derive_messages() 取历史并估算 token 压力
+        2. 超阈值且通过重触发保护 → build_compaction_prompt
+        3. 经现有单一 provider 生成摘要 → session.summary
+        4. emit ignorable 的 compaction_occurred 事件（不入衍生消息历史）
+        任何失败都返回 False —— 压缩绝不能打断当前 turn。
+        """
+```
+
+**摘要如何到达模型**：`session.summary` 更新后，调用方同步 `SummaryContextSource.update_summary()`。该源在 `initialize` 时因摘要为空而 `Unavailable`（不在快照中），下一 turn 的 `reconcile` 将其视为**新注册源**返回 `Updated`（携带 `## Previous Session Summary`），经 Phase 4 的 inbox 注入路径在 step 边界折叠进 system context —— **无需 baseline replace**。物理替换衍生历史中段的 `SessionLog.replace(start, end)` 表面操作（dsh `SurfaceOp.replace`）留待后续阶段。
+
+**重触发保护**：因为摘要注入不缩小衍生历史，裸阈值检查会每步重触发；Bridge 记住上次压缩时的 token 水位，只有对话增长超过一个 buffer 后才允许再次压缩。策略（CompactionEngine）保持无状态。
 
 ---
 
@@ -801,37 +767,47 @@ class MidConversationSystemMessage:
 
 @dataclass
 class PreparedTurn:
-    """准备好的模型调用"""
+    """准备好的模型调用（实际实现）"""
     system_context: str
-    messages: list[Message]
-    tools: list[ToolDefinition]
-    context_update: MidConversationSystemMessage | None
-    admitted: list[Prompt]
-    settled: list[ToolResult]
+    messages: list[dict[str, Any]]
+    tools: list[dict[str, Any]]
+    context_update: str | None = None  # 保留字段；实际注入已在 prepare 内折叠
+    admitted: list[Prompt] = field(default_factory=list)
+    settled: list[ToolResult] = field(default_factory=list)
 
-class ReconcileResult:
-    """协调结果"""
-    pass
-
-@dataclass
-class Unchanged(ReconcileResult):
-    tag: str = "Unchanged"
+    def has_work(self) -> bool:
+        return bool(self.admitted or self.settled)
 
 @dataclass
-class Updated(ReconcileResult):
-    text: str
-    snapshot: Snapshot
-    tag: str = "Updated"
+class DrainResult:
+    """Drain 执行结果（实际实现）"""
+    status: str = "no_work"  # no_work | tool_execution | text_response | error
+    content: str | None = None
+    tool_calls: list[ToolCall] = field(default_factory=list)
+    tool_results: list[ToolResult] = field(default_factory=list)
+    error: str | None = None
+```
 
-@dataclass
-class ReplacementReady(ReconcileResult):
-    generation: Generation
-    tag: str = "ReplacementReady"
+**Session 实体**（实际实现于 drain.py，持久化结构见 Module 02 的 `SessionStore`）：
 
-@dataclass
-class ReplacementBlocked(ReconcileResult):
-    unavailable_keys: list[str] = field(default_factory=list)
-    tag: str = "ReplacementBlocked"
+```python
+class Session:
+    """会话持久化实体 - agent/drain.py"""
+    id / cwd / title / agent_mode / status / created_at / updated_at
+    history: list[dict]                    # 会话历史（Phase 1 双写保留）
+    log: SessionLog                        # append-only 事件日志（未来唯一事实源）
+    inbox: Inbox                           # next_turn prompts + next_step 注入
+    pending_tool_results: list[ToolResult] # 待结算工具结果
+    context_snapshot: dict                 # 上下文快照
+    baseline_system_context: str
+    token_count: int
+    summary: str                           # Phase 5 压缩摘要（由 SummaryContextSource 呈现）
+
+    def submit_prompt(text) -> Prompt      # 入 inbox.next_turn 队列
+    def drain_injections() -> list[Inject] # step 边界领取注入（记录 context_injection 事件）
+    def has_pending_tool_calls() -> bool
+    def add_tool_result(result) -> None
+    def _emit(type, data, ignorable)       # 双写辅助：镜像写事件日志
 ```
 
 ---
@@ -840,24 +816,37 @@ class ReplacementBlocked(ReconcileResult):
 
 | 接口 | 方向 | 说明 |
 |------|------|------|
-| `ModelProvider` | 依赖 | 模型调用抽象层 |
-| `SessionStore` | 依赖 | 会话持久化 |
-| `PermissionRuleset` | 依赖 | 权限检查 |
-| `AuditLog` | 输出 | 审计日志记录 |
-| `EventBus` | 输出 | 事件发布 |
+| `ModelProvider` | 依赖 | 模型调用抽象层（runtime/providers.py，仅 OpenAI 兼容实现） |
+| `SessionStore` / `SessionManager` | 依赖 | 会话持久化（runtime/session.py） |
+| `PermissionRuleset` | 依赖 | 权限检查（agent/permissions.py） |
+| `SystemContextRegistry` | 依赖 | 每步 reconcile（Phase 4，注入协调器） |
+| `CompactionBridge` / `SummaryContextSource` | 依赖 | 每步压缩压力检查（Phase 5，注入协调器） |
+| `SessionDriver` | 协作 | turn/step 生命周期（harness/driver.py，由应用层驱动） |
+| `AuditLog` | 输出 | 审计日志记录（production/audit.py） |
+| `EventBus` | 输出 | 进程内事件发布（common/events.py） |
+| `JSONLTranscript` | 输出 | JSONL 事件溯源（runtime/transcript.py，应用层写入） |
 
 ---
 
-## 9. 实现计划
+## 9. 实现状态（v2.1 更新）
 
-| 阶段 | 内容 | 产出 |
-|------|------|------|
-| Phase 1 | System Context 基础架构 | 上下文源可注册、可刷新 |
-| Phase 2 | Session Drain + Provider Turn | 清晰的执行边界 |
-| Phase 3 | Type-safe Tool System | Schema 验证的工具 |
-| Phase 4 | Permission Ruleset | 通配符权限 |
-| Phase 5 | Structured Compaction | 高质量压缩 |
+| 能力 | 状态 | 实现位置 |
+|------|------|----------|
+| Session Drain + Provider-Turn Boundary | ✅ 已实现 | agent/drain.py |
+| Prompt Promotion（Inbox next_turn） | ✅ 已实现 | agent/drain.py + harness/inbox.py |
+| Harness turn/step 状态机 + 软停止钩子 | ✅ 已实现 | harness/driver.py |
+| Append-only SessionLog + derive_messages | ✅ 已实现 | harness/session_log.py、harness/events.py |
+| 三阶段工具管道（pre/execute/post + finalize） | ✅ 已实现 | harness/tool_pipeline.py |
+| Type-safe Tool Registry（JSON Schema） | ✅ 已实现 | agent/tools.py |
+| 内置工具 8 个 | ✅ 已实现 | agent/tools.py BuiltInTools |
+| Wildcard Permission Ruleset（优先级 + last-match） | ✅ 已实现 | agent/permissions.py |
+| Agent Modes（build/plan/general）默认权限 | ✅ 已实现 | agent/modes.py、agent/permissions.py |
+| 无状态 CompactionEngine + CompactionBridge | ✅ 已实现 | context/compaction.py、harness/compaction_bridge.py |
+| Non-waking context 注入（Phase 4） | ✅ 已实现 | harness/inbox.py + agent/drain.py |
+| websearch / task / skill 工具 | ⏳ 规划中 | 未注册 |
+| SessionLog SurfaceOp.replace（物理压缩历史） | ⏳ 规划中 | 摘要目前经注入路径呈现 |
+| ask 决策的人工确认交互 | ⏳ 规划中 | 自动化路径目前自动拒绝 |
 
 ---
 
-*文档版本: v2.0 | 创建日期: 2026-08-27 | 基于 opencode 架构优化*
+*文档版本: v2.1 | 创建日期: 2026-08-27 | 更新日期: 2026-09-03 | 基于 opencode + deepseek-harness 架构，已与实现代码对齐*

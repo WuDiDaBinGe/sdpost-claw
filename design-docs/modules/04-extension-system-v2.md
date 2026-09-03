@@ -1,5 +1,11 @@
 # Module 04: Extension System v2 — 扩展系统（opencode 增强版）
 
+> **v2.1 实现对齐说明（2026-09-03）**：本节已按实际代码更新。要点变更：
+> - `SkillRegistry`（extensions/skills.py）实际与设计基本一致；`get_available_for_agent()` 当前**未做权限过滤**（直接返回 `list_all()`）
+> - `MCPConnector`（extensions/mcp.py）实际直接在传输层上走 JSON-RPC（initialize / tools/list / tools/call），无 `MCPClient` 类；MCP 工具到 `ToolDefinition` 的包装（权限前缀、输出限制）已设计但**尚未接线**到 ToolRegistry
+> - Experts 实际为 `Expert` 数据类 + `ExpertRegistry`（5 个默认专家），构建于 `agent/modes.py` 的 `Agent` / `AgentMode` / `AgentRegistry` 之上；`AgentPermissions`（agent/permissions.py）提供 build/plan/general 三档默认权限构建器
+> - `SkillContextSource` 独立类未实现；实际由 `AgentSkillsContextSource`（context/source.py）直接持有 `list[SkillInfo]`
+
 ## 1. 设计演进说明
 
 本模块在初版设计基础上，吸收了 opencode 的以下优秀设计：
@@ -12,557 +18,264 @@
 
 ---
 
-## 2. Skill System v2（多来源技能发现）
+## 2. Skill System v2（实际实现于 extensions/skills.py）
 
 ### 2.1 设计理念（借鉴 opencode skill.ts）
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                    Skill Discovery Architecture                       │
-│                    (借鉴 opencode skill.ts)                           │
-├─────────────────────────────────────────────────────────────────────┤
-│                                                                      │
-│   ┌─────────────────────────────────────────────────────────────┐   │
-│   │                    Skill Source (技能来源)                   │   │
-│   │                                                             │   │
-│   │   - EmbeddedSource: 内置技能                                │   │
-│   │   - DirectorySource: 本地目录技能                           │   │
-│   │   - UrlSource: 远程 URL 技能                                │   │
-│   │                                                             │   │
-│   └─────────────────────────────────────────────────────────────┘   │
-│                                                                      │
-│   ┌─────────────────────────────────────────────────────────────┐   │
-│   │                    Skill Info (技能信息)                     │   │
-│   │                                                             │   │
-│   │   - name: 技能名称                                          │   │
-│   │   - description: 技能描述                                   │   │
-│   │   - slash: 是否支持斜杠命令                                  │   │
-│   │   - location: 文件位置                                      │   │
-│   │   - content: 技能内容 (Markdown)                            │   │
-│   │                                                             │   │
-│   └─────────────────────────────────────────────────────────────┘   │
-│                                                                      │
-│   ┌─────────────────────────────────────────────────────────────┐   │
-│   │                    Skill Filtering (技能过滤)                │   │
-│   │                                                             │   │
-│   │   - 基于 Agent 权限过滤                                     │   │
-│   │   - 基于 Agent 模式过滤                                     │   │
-│   │   - 基于用户配置过滤                                        │   │
-│   │                                                             │   │
-│   └─────────────────────────────────────────────────────────────┘   │
-│                                                                      │
-└─────────────────────────────────────────────────────────────────────┘
+Skill Source（embedded / directory / url）
+        ↓ 多来源加载 + 按 source_key 缓存
+SkillInfo（name / description / slash / location / content）
+        ↓ list_all() 去重合并（后注册覆盖同名）
+上下文注入 / 斜杠命令 / Web UI 侧边栏
 ```
 
 ### 2.2 Skill 发现实现
 
 ```python
-class SkillSource:
-    """技能来源 - 借鉴 opencode 的 Source 设计"""
-
-    @staticmethod
-    def embedded(skill: SkillInfo) -> EmbeddedSource:
-        """内置技能"""
-        return EmbeddedSource(skill=skill)
-
-    @staticmethod
-    def directory(path: Path) -> DirectorySource:
-        """本地目录技能"""
-        return DirectorySource(path=str(path))
-
-    @staticmethod
-    def url(url: str) -> UrlSource:
-        """远程 URL 技能"""
-        return UrlSource(url=url)
-
 @dataclass
 class SkillInfo:
-    """技能信息"""
     name: str
     description: str | None
     slash: bool
     location: Path
     content: str
 
+
+@dataclass
+class Source:
+    type: str  # "embedded" | "directory" | "url"
+    path: str | None = None
+    url: str | None = None
+    skill: SkillInfo | None = None
+
+
+class SkillSource:
+    """来源工厂"""
+    @staticmethod
+    def embedded(skill: SkillInfo) -> Source: ...
+    @staticmethod
+    def directory(path: Path) -> Source: ...
+    @staticmethod
+    def url(url: str) -> Source: ...
+
+
 class SkillRegistry:
-    """
-    技能注册表 - 借鉴 opencode 的 Skill Registry
+    """多来源技能发现（带 per-source 缓存）"""
 
-    支持多来源技能发现:
-    - 内置技能 (Embedded)
-    - 本地目录 (Directory)
-    - 远程 URL (Url)
-    """
-
-    def __init__(self):
-        self._sources: list[Source] = []
-        self._cache: dict[str, list[SkillInfo]] = {}
-
-    def add_source(self, source: Source):
-        """添加技能来源"""
-        self._sources.append(source)
-        # 清除缓存
-        self._cache.clear()
-
-    async def list_all(self) -> list[SkillInfo]:
-        """列出所有技能"""
-        skills: dict[str, SkillInfo] = {}
-
-        for source in self._sources:
-            source_key = self._source_key(source)
-            cached = self._cache.get(source_key)
-            if cached is not None:
-                for skill in cached:
-                    skills[skill.name] = skill
-                continue
-
-            loaded = await self._load_from_source(source)
-            self._cache[source_key] = loaded
-            for skill in loaded:
-                skills[skill.name] = skill
-
-        return list(skills.values())
-
+    def add_source(self, source: Source) -> None: ...   # 清空缓存
+    async def list_all(self) -> list[SkillInfo]: ...
     async def get_available_for_agent(self, agent_id: str) -> list[SkillInfo]:
-        """获取 Agent 可用的技能（基于权限过滤）"""
-        all_skills = await self.list_all()
-        agent = await self.agent_store.get(agent_id)
-
-        return [
-            skill for skill in all_skills
-            if self._check_permission(skill, agent)
-        ]
-
-    async def _load_from_source(self, source: Source) -> list[SkillInfo]:
-        """从来源加载技能"""
-        if source.type == "embedded":
-            return [source.skill]
-
-        if source.type == "directory":
-            return await self._load_from_directory(Path(source.path))
-
-        if source.type == "url":
-            return await self._load_from_url(source.url)
-
-        return []
+        # 现状：直接返回 list_all()，权限过滤待接入
 
     async def _load_from_directory(self, directory: Path) -> list[SkillInfo]:
-        """从目录加载技能"""
-        skills = []
-
-        # 查找所有 SKILL.md 和 *.md 文件
-        patterns = ["*.md", "**/SKILL.md"]
-        for pattern in patterns:
-            for filepath in directory.rglob(pattern):
-                if not filepath.is_file():
-                    continue
-
-                content = filepath.read_text(encoding="utf-8")
-                frontmatter = self._parse_frontmatter(content)
-
-                if frontmatter is None:
-                    continue
-
-                name = frontmatter.get("name")
-                if name is None:
-                    # 使用目录名或文件名
-                    if filepath.name == "SKILL.md":
-                        name = filepath.parent.name
-                    else:
-                        name = filepath.stem
-
-                skills.append(SkillInfo(
-                    name=name,
-                    description=frontmatter.get("description"),
-                    slash=frontmatter.get("slash", False),
-                    location=filepath,
-                    content=content,
-                ))
-
-        return skills
+        # patterns = ["*.md", "**/SKILL.md", "**/skill.md"]，用 set 去重文件
+        # 解析 YAML frontmatter（^---\n...\n---\n），name 缺省取目录名/文件 stem
+        # slash 取 frontmatter.get("slash", False)；读取失败静默跳过
 
     async def _load_from_url(self, url: str) -> list[SkillInfo]:
-        """从 URL 加载技能"""
-        # 下载并缓存远程技能
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url) as response:
-                if response.status == 200:
-                    content = await response.text()
-                    # 解析并返回技能
-                    return self._parse_remote_skills(content)
-        return []
+        # aiohttp 拉取，整体 try/except，失败返回 []
 
-    def _parse_frontmatter(self, content: str) -> dict | None:
-        """解析 YAML frontmatter"""
-        match = re.match(r"^---\n(.*?)\n---\n", content, re.DOTALL)
-        if not match:
-            return None
-        try:
-            return yaml.safe_load(match.group(1))
-        except yaml.YAMLError:
-            return None
 
-    def _check_permission(self, skill: SkillInfo, agent: Agent) -> bool:
-        """检查 Agent 是否有权限使用该技能"""
-        decision = agent.permissions.evaluate(f"skill.{skill.name}")
-        return decision.effect != "deny"
-
-    def _source_key(self, source: Source) -> str:
-        """生成来源 key"""
-        if source.type == "embedded":
-            return f"embedded:{source.skill.name}"
-        elif source.type == "directory":
-            return f"directory:{source.path}"
-        elif source.type == "url":
-            return f"url:{source.url}"
-        return ""
+async def discover_skills(paths: list[Path]) -> list[SkillInfo]:
+    """便捷函数：多路径一次性发现"""
 ```
 
-### 2.3 Skill 作为 Context Source
+### 2.3 Skill 注入系统上下文
 
-```python
-class SkillContextSource(ContextSource[SkillsValue]):
-    """技能上下文源 - 将可用技能注入系统上下文"""
-
-    key = "agent/skills"
-
-    def __init__(self, agent: Agent, skill_registry: SkillRegistry):
-        self.agent = agent
-        self.registry = skill_registry
-
-    async def load(self) -> SkillsValue | Unavailable:
-        skills = await self.registry.get_available_for_agent(self.agent.id)
-        if not skills:
-            return Unavailable("No skills available")
-        return SkillsValue(skills=skills)
-
-    def baseline(self, value: SkillsValue) -> str:
-        parts = ["## Available Skills"]
-        for skill in value.skills:
-            if skill.slash:
-                parts.append(f"- **/{skill.name}**: {skill.description or 'No description'}")
-            else:
-                parts.append(f"- **{skill.name}**: {skill.description or 'No description'}")
-        return "\n".join(parts)
-
-    def update(self, previous: SkillsValue, current: SkillsValue) -> str:
-        added = len(current.skills) - len(previous.skills)
-        if added > 0:
-            return f"{added} new skill(s) available"
-        elif added < 0:
-            return f"{abs(added)} skill(s) removed"
-        return "Skills updated"
-```
+桌面端 `DesktopServer.setup()` 注册技能源（bundled skills 目录 + `config.skill_dirs`），`/api/skills` 提供侧边栏列表。上下文注入由 `AgentSkillsContextSource`（context/source.py）承担——直接持有 `list[SkillInfo]`（见 Module 03 §2.3），slash 技能以 `**/name**` 形式渲染。
 
 ---
 
-## 3. MCP Connectors v2（权限感知）
+## 3. MCP Connectors（实际实现于 extensions/mcp.py）
 
-### 3.1 设计理念
+### 3.1 传输层
 
 ```python
-class MCPConnector:
-    """
-    MCP 连接器 - 增强版
-
-    特性:
-    - 权限感知的工具暴露
-    - 自动 Schema 验证
-    - 输出大小限制
-    """
-
-    def __init__(
-        self,
-        name: str,
-        transport: MCPTransport,
-        permission_prefix: str = "mcp",
-        max_output_chars: int = 2000,
-    ):
-        self.name = name
-        self.transport = transport
-        self.permission_prefix = permission_prefix
-        self.max_output_chars = max_output_chars
-        self._client: MCPClient | None = None
-
-    async def connect(self):
-        """连接到 MCP 服务器"""
-        self._client = MCPClient(self.transport)
-        await self._client.connect()
-
-    async def disconnect(self):
-        """断开连接"""
-        if self._client:
-            await self._client.disconnect()
-            self._client = None
-
-    async def list_tools(self) -> list[ToolDefinition]:
-        """列出可用工具（带权限和输出限制）"""
-        if not self._client:
-            raise ConnectionError("Not connected to MCP server")
-
-        mcp_tools = await self._client.list_tools()
-        return [
-            self._wrap_tool(tool) for tool in mcp_tools
-        ]
-
-    def _wrap_tool(self, mcp_tool: MCPTool) -> ToolDefinition:
-        """包装 MCP 工具，添加权限和输出限制"""
-        return ToolDefinition(
-            name=f"{self.name}.{mcp_tool.name}",
-            description=mcp_tool.description,
-            input_schema=mcp_tool.input_schema,
-            output_schema=mcp_tool.output_schema,
-            permission=f"{self.permission_prefix}.{self.name}.{mcp_tool.name}",
-            max_output_chars=self.max_output_chars,
-            execute=lambda input_data, context: self._execute(mcp_tool.name, input_data, context),
-        )
-
-    async def _execute(
-        self,
-        tool_name: str,
-        input_data: dict,
-        context: ToolContext,
-    ) -> dict:
-        """执行 MCP 工具"""
-        if not self._client:
-            raise ConnectionError("Not connected to MCP server")
-
-        result = await self._client.call_tool(tool_name, input_data)
-        return result
-
 class MCPTransport(ABC):
-    """MCP 传输抽象"""
-
-    @abstractmethod
-    async def connect(self):
-        pass
-
-    @abstractmethod
-    async def disconnect(self):
-        pass
-
-    @abstractmethod
-    async def send(self, data: dict):
-        pass
-
-    @abstractmethod
-    async def receive(self) -> dict:
-        pass
+    async def connect(self) -> None: ...
+    async def disconnect(self) -> None: ...
+    async def send(self, data: dict) -> None: ...
+    async def receive(self) -> dict: ...
 
 class StdioMCPTransport(MCPTransport):
-    """stdio 传输"""
-
-    def __init__(self, command: str, args: list[str] | None = None):
-        self.command = command
-        self.args = args or []
-        self._process: asyncio.subprocess.Process | None = None
-
-    async def connect(self):
-        self._process = await asyncio.create_subprocess_exec(
-            self.command, *self.args,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-
-    async def disconnect(self):
-        if self._process:
-            self._process.terminate()
-            await self._process.wait()
-            self._process = None
-
-    async def send(self, data: dict):
-        if self._process and self._process.stdin:
-            self._process.stdin.write(json.dumps(data).encode() + b"\n")
-            await self._process.stdin.drain()
-
-    async def receive(self) -> dict:
-        if self._process and self._process.stdout:
-            line = await self._process.stdout.readline()
-            return json.loads(line.decode())
-        return {}
+    """子进程 stdio 传输：create_subprocess_exec + 行协议 JSON-RPC；
+    disconnect 先 terminate 5s 超时后 kill；可选 env"""
 
 class SSEMCPTransport(MCPTransport):
-    """SSE 传输"""
-
-    def __init__(self, url: str, headers: dict | None = None):
-        self.url = url
-        self.headers = headers or {}
-        self._session: aiohttp.ClientSession | None = None
-
-    async def connect(self):
-        self._session = aiohttp.ClientSession(headers=self.headers)
-
-    async def disconnect(self):
-        if self._session:
-            await self._session.close()
-            self._session = None
-
-    async def send(self, data: dict):
-        if self._session:
-            async with self._session.post(self.url, json=data) as response:
-                return await response.json()
-        return {}
-
-    async def receive(self) -> dict:
-        # SSE 长连接接收
-        if self._session:
-            async with self._session.get(self.url) as response:
-                async for line in response.content:
-                    if line.startswith(b"data: "):
-                        return json.loads(line[6:])
-        return {}
+    """SSE 传输（简化实现）：send 走 POST；receive 尚未实现流式解析，
+    返回 {} —— 完整 SSE 需要流式读取，属已知缺口"""
 ```
+
+### 3.2 MCPConnector（JSON-RPC 直连）
+
+```python
+class MCPTool:
+    name: str
+    description: str
+    input_schema: dict
+
+
+class MCPConnector:
+    """权限感知的 MCP 工具暴露（extensions/mcp.py，实际实现）"""
+
+    def __init__(self, name, transport, permission_prefix="mcp", max_output_chars=2000): ...
+
+    async def connect(self) -> None:
+        # transport.connect()
+        # → _initialize(): JSON-RPC "initialize"（protocolVersion 2024-11-05）
+        # → _list_tools(): JSON-RPC "tools/list"，解析 inputSchema
+
+    async def disconnect(self) -> None: ...
+
+    def list_tools(self) -> list[MCPTool]:
+        """同步返回 connect 时发现的工具缓存"""
+
+    async def call_tool(self, tool_name: str, arguments: dict) -> dict:
+        # JSON-RPC "tools/call"
+
+    def get_permission(self, tool_name: str) -> str:
+        return f"{self.permission_prefix}.{self.name}.{tool_name}"
+```
+
+### 3.3 与 ToolRegistry 的接线（待办）
+
+设计上的包装（未接线）：
+
+```python
+# 计划：将 MCPTool 包装为 ToolDefinition 注册进 ToolRegistry
+ToolDefinition(
+    name=f"{connector.name}.{mcp_tool.name}",
+    input_schema=mcp_tool.input_schema,
+    permission=connector.get_permission(mcp_tool.name),  # mcp.<name>.<tool>
+    max_output_chars=connector.max_output_chars,
+    execute_fn=...,   # 转发 call_tool
+)
+```
+
+> 现状：`/api/connectors` 返回 `config.mcp_servers` 配置列表；连接器生命周期管理与工具注入执行链路尚未接入 `SessionRunner`。
 
 ---
 
-## 4. Experts System v2（多模式 Agent）
+## 4. Experts & Agent Modes（实际实现于 agent/modes.py + extensions/experts.py）
 
-### 4.1 设计理念（借鉴 opencode 的 Agent Modes）
+### 4.1 Agent Modes（agent/modes.py）
 
 ```python
 class AgentMode(Enum):
-    """Agent 模式 - 借鉴 opencode 的 build/plan/general"""
-    BUILD = "build"        # 完全访问权限
-    PLAN = "plan"          # 只读权限
-    GENERAL = "general"    # 子 Agent 模式
+    BUILD = "build"      # 完全访问
+    PLAN = "plan"        # 只读
+    GENERAL = "general"  # 子 Agent 模式
 
+
+@dataclass
 class Agent:
-    """
-    Agent - 增强版
+    id: str = generate_id()
+    name: str = "sdpost"
+    mode: AgentMode = AgentMode.BUILD
+    permissions: PermissionRuleset
+    skills: list[str]
+    system_prompt: str = ""
 
-    特性:
-    - 多模式支持 (build/plan/general)
-    - 权限规则集
-    - 技能过滤
-    """
+    def __post_init__(self):
+        # 无规则时按模式生成默认权限
+        # build → AgentPermissions.build() / plan → AgentPermissions.plan()
+        # general → AgentPermissions.general()
 
-    def __init__(
-        self,
-        id: str,
-        name: str,
-        mode: AgentMode = AgentMode.BUILD,
-        permissions: PermissionRuleset | None = None,
-        skills: list[str] | None = None,
-    ):
-        self.id = id
-        self.name = name
-        self.mode = mode
-        self.permissions = permissions or self._default_permissions(mode)
-        self.skills = skills or []
+    def can(self, action: str) -> bool: ...
+    def cannot(self, action: str) -> bool: ...
 
-    def _default_permissions(self, mode: AgentMode) -> PermissionRuleset:
-        """根据模式生成默认权限"""
-        if mode == AgentMode.BUILD:
-            return PermissionRuleset.build()
-        elif mode == AgentMode.PLAN:
-            return PermissionRuleset.plan()
-        elif mode == AgentMode.GENERAL:
-            return PermissionRuleset.build()  # 子 Agent 默认完全访问
-        return PermissionRuleset()
 
 class AgentRegistry:
-    """Agent 注册表"""
-
-    def __init__(self):
-        self._agents: dict[str, Agent] = {}
-
-    def register(self, agent: Agent):
-        """注册 Agent"""
-        self._agents[agent.id] = agent
-
-    def get(self, agent_id: str) -> Agent | None:
-        """获取 Agent"""
-        return self._agents.get(agent_id)
-
-    def create_sub_agent(
-        self,
-        parent: Agent,
-        name: str,
-        mode: AgentMode = AgentMode.GENERAL,
-    ) -> Agent:
-        """创建子 Agent"""
-        return Agent(
-            id=generate_id(),
-            name=name,
-            mode=mode,
-            permissions=parent.permissions,  # 继承父 Agent 权限
-            skills=parent.skills,
-        )
+    def register / get / get_by_name / unregister / list_all
+    def create_sub_agent(self, parent, name, mode=AgentMode.GENERAL) -> Agent:
+        # 继承父 Agent 的 permissions 与 skills
 ```
 
-### 4.2 Agent 作为 Context Source
+### 4.2 Experts（extensions/experts.py）
 
 ```python
-class AgentContextSource(ContextSource[AgentValue]):
-    """Agent 上下文源 - 将 Agent 信息注入系统上下文"""
+@dataclass
+class Expert:
+    """预配置的专家人格：system_prompt + 工具集 + 权限 + 技能"""
+    id: str
+    name: str
+    description: str
+    system_prompt: str
+    mode: AgentMode
+    tools: list[str]
+    skills: list[str]
+    metadata: dict
 
-    key = "agent/info"
+    def to_agent(self) -> Agent: ...
 
-    def __init__(self, agent: Agent):
-        self.agent = agent
 
-    async def load(self) -> AgentValue | Unavailable:
-        return AgentValue(
-            name=self.agent.name,
-            mode=self.agent.mode.value,
-            skills_count=len(self.agent.skills),
-        )
+class ExpertRegistry:
+    """内置 5 个默认专家（注册时即创建）：
+    - coder（BUILD）    软件开发
+    - analyst（BUILD）  数据分析
+    - writer（BUILD）   技术写作
+    - reviewer（PLAN）  代码评审
+    - planner（PLAN）   项目规划
+    """
 
-    def baseline(self, value: AgentValue) -> str:
-        return (
-            f"## Current Agent\n"
-            f"Name: {value.name}\n"
-            f"Mode: {value.mode}\n"
-            f"Available Skills: {value.skills_count}"
-        )
-
-    def update(self, previous: AgentValue, current: AgentValue) -> str:
-        if previous.mode != current.mode:
-            return f"Agent mode changed: {previous.mode} → {current.mode}"
-        return "Agent info updated"
+    def register / get / list_all / list_names / unregister
+    def create_agent_from_expert(self, expert_name, agent_name=None) -> Agent | None: ...
 ```
+
+`/api/experts` 以 `{id, name, description, mode}` 形式暴露给 Web UI。
 
 ---
 
 ## 5. 数据模型
 
 ```python
+# extensions/skills.py
 @dataclass
 class SkillInfo:
-    """技能信息"""
     name: str
     description: str | None
     slash: bool
     location: Path
     content: str
 
+# agent/modes.py
+class AgentMode(Enum):
+    BUILD = "build"
+    PLAN = "plan"
+    GENERAL = "general"
+
 @dataclass
 class Agent:
-    """Agent"""
     id: str
     name: str
     mode: AgentMode
     permissions: PermissionRuleset
     skills: list[str]
+    system_prompt: str
 
+# extensions/experts.py
+@dataclass
+class Expert:
+    id: str
+    name: str
+    description: str
+    system_prompt: str
+    mode: AgentMode
+    tools: list[str]
+    skills: list[str]
+    metadata: dict
+
+# context/source.py（上下文值类型）
 @dataclass
 class AgentValue:
-    """Agent 上下文值"""
     name: str
     mode: str
     skills_count: int
 
 @dataclass
 class SkillsValue:
-    """技能上下文值"""
     skills: list[SkillInfo]
-
-class AgentMode(Enum):
-    """Agent 模式"""
-    BUILD = "build"
-    PLAN = "plan"
-    GENERAL = "general"
 ```
 
 ---
@@ -571,24 +284,26 @@ class AgentMode(Enum):
 
 | 接口 | 方向 | 说明 |
 |------|------|------|
-| `SkillRegistry` | 核心 | 技能管理 |
-| `MCPConnector` | 扩展 | MCP 工具暴露 |
-| `AgentRegistry` | 核心 | Agent 管理 |
-| `PermissionRuleset` | 依赖 | 权限检查 |
-| `ContextSource` | 输出 | 上下文注入 |
+| `SkillRegistry` | 核心 | 技能管理（DesktopServer 侧边栏 + 技能源注册） |
+| `MCPConnector` | 扩展 | MCP 工具暴露（ToolRegistry 接线待完成） |
+| `ExpertRegistry` | 核心 | 专家人格管理 |
+| `Agent` / `AgentRegistry` | 核心 | 多模式 Agent（agent/modes.py） |
+| `PermissionRuleset` | 依赖 | 权限检查（AgentPermissions 三档默认） |
+| `AgentSkillsContextSource` / `AgentContextSource` | 输出 | 上下文注入（context/source.py） |
 
 ---
 
 ## 7. 实现计划
 
-| 阶段 | 内容 | 产出 |
+| 阶段 | 内容 | 状态 |
 |------|------|------|
-| Phase 1 | Skill Discovery | 多来源技能发现 |
-| Phase 2 | Skill Context Source | 技能上下文注入 |
-| Phase 3 | MCP Connector v2 | 权限感知的 MCP |
-| Phase 4 | Agent Modes | 多模式 Agent |
-| Phase 5 | Agent Context Source | Agent 上下文注入 |
+| Phase 1 | Skill Discovery（多来源 + 缓存） | ✅ 已完成（extensions/skills.py） |
+| Phase 2 | Skill Context Source | ✅ 已完成（AgentSkillsContextSource，直接持有技能列表） |
+| Phase 3 | MCP Connector（传输 + JSON-RPC） | ⚠️ 骨架完成；SSE receive 与 ToolRegistry 接线待完成 |
+| Phase 4 | Agent Modes（build/plan/general） | ✅ 已完成（agent/modes.py + AgentPermissions） |
+| Phase 5 | Experts 系统 | ✅ 已完成（extensions/experts.py，5 个默认专家） |
+| Phase 6 | Skill 权限过滤（get_available_for_agent） | ⏳ 待接入 |
 
 ---
 
-*文档版本: v2.0 | 创建日期: 2026-08-27 | 基于 opencode 架构优化*
+*文档版本: v2.1 | 创建日期: 2026-08-27 | 最近更新: 2026-09-03 | 基于 opencode 架构优化*

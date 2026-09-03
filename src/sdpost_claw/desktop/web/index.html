@@ -35,15 +35,6 @@
                     </span>
                     <span class="nav-label">新任务</span>
                 </button>
-                <button class="nav-item" data-view="chat" data-key="agent">
-                    <span class="nav-icon">
-                        <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
-                            <circle cx="8" cy="5" r="3" stroke="currentColor" stroke-width="1.5"/>
-                            <path d="M3 14c0-2.8 2.2-5 5-5s5 2.2 5 5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
-                        </svg>
-                    </span>
-                    <span class="nav-label">智能体</span>
-                </button>
                 <button class="nav-item" data-view="list" data-key="projects">
                     <span class="nav-icon">
                         <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
@@ -62,54 +53,6 @@
                     </span>
                     <span class="nav-label">专家·技能·连接器</span>
                 </button>
-                <button class="nav-item" data-view="list" data-key="automation">
-                    <span class="nav-icon">
-                        <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
-                            <circle cx="8" cy="8" r="6" stroke="currentColor" stroke-width="1.5"/>
-                            <path d="M8 4v4l3 2" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
-                        </svg>
-                    </span>
-                    <span class="nav-label">自动化</span>
-                </button>
-                <button class="nav-item" data-view="list" data-key="library">
-                    <span class="nav-icon">
-                        <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
-                            <path d="M2 4l6-2 6 2v8l-6 2-6-2V4z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/>
-                            <path d="M2 4l6 2 6-2" stroke="currentColor" stroke-width="1.5"/>
-                        </svg>
-                    </span>
-                    <span class="nav-label">资料库</span>
-                </button>
-                <button class="nav-item" data-view="list" data-key="more">
-                    <span class="nav-icon">
-                        <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
-                            <circle cx="8" cy="4" r="1" fill="currentColor"/>
-                            <circle cx="8" cy="8" r="1" fill="currentColor"/>
-                            <circle cx="8" cy="12" r="1" fill="currentColor"/>
-                        </svg>
-                    </span>
-                    <span class="nav-label">更多</span>
-                </button>
-                <button class="nav-item" data-view="list" data-key="apps">
-                    <span class="nav-icon">
-                        <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
-                            <rect x="2" y="2" width="5" height="5" rx="1" stroke="currentColor" stroke-width="1.5"/>
-                            <rect x="9" y="2" width="5" height="5" rx="1" stroke="currentColor" stroke-width="1.5"/>
-                            <rect x="2" y="9" width="5" height="5" rx="1" stroke="currentColor" stroke-width="1.5"/>
-                            <rect x="9" y="9" width="5" height="5" rx="1" stroke="currentColor" stroke-width="1.5"/>
-                        </svg>
-                    </span>
-                    <span class="nav-label">应用·灵感</span>
-                </button>
-                <button class="nav-item" data-view="list" data-key="settings">
-                    <span class="nav-icon">
-                        <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
-                            <circle cx="8" cy="8" r="3" stroke="currentColor" stroke-width="1.5"/>
-                            <path d="M8 1v3M8 12v3M1 8h3M12 8h3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
-                        </svg>
-                    </span>
-                    <span class="nav-label">设置</span>
-                </button>
             </nav>
 
             <div class="sidebar-section">
@@ -121,7 +64,7 @@
             </div>
 
             <div class="sidebar-footer">
-                <div class="user-card">
+                <div class="user-card" id="userCard" title="点击打开菜单">
                     <div class="user-avatar">
                         <svg width="20" height="20" viewBox="0 0 20 20" fill="none">
                             <circle cx="10" cy="7" r="4" stroke="#9aa0aa" stroke-width="1.5"/>
@@ -132,6 +75,15 @@
                         <span class="user-name">本地用户</span>
                         <span class="user-sub">完成任务赢积分 ›</span>
                     </div>
+                </div>
+                <div class="user-menu hidden" id="userMenu">
+                    <button class="user-menu-item" id="menuSettingsBtn">
+                        <svg width="14" height="14" viewBox="0 0 16 16" fill="none">
+                            <circle cx="8" cy="8" r="3" stroke="currentColor" stroke-width="1.5"/>
+                            <path d="M8 1v3M8 12v3M1 8h3M12 8h3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+                        </svg>
+                        <span>设置</span>
+                    </button>
                 </div>
             </div>
         </aside>
@@ -189,6 +141,7 @@
 
                 <div class="input-area">
                     <div class="input-box-wrap">
+                        <div class="mention-popup hidden" id="mentionPopup"></div>
                         <textarea id="inputBox" class="input-box" rows="1"
                             placeholder="输入指令，或 @引用文件 / /调用技能..." spellcheck="false"></textarea>
                         <button class="send-btn" id="sendBtn" title="发送">
@@ -275,7 +228,7 @@
             <div class="modal-body" id="modelModalBody">
                 <div class="form-group">
                     <label class="form-label">模型 ID</label>
-                    <input type="text" class="form-input" id="editModelId" placeholder="例如: my-model" readonly>
+                    <input type="text" class="form-input" id="editModelId" placeholder="例如: my-model">
                 </div>
                 <div class="form-group">
                     <label class="form-label">显示名称</label>
@@ -312,6 +265,6 @@
         </div>
     </div>
 
-    <script src="/static/app.js"></script>
+    <script src="/static/app.js?v=3"></script>
 </body>
 </html>

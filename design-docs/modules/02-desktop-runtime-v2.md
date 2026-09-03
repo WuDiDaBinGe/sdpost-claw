@@ -1,5 +1,12 @@
 # Module 02: Desktop Runtime v2 — 桌面运行时（opencode 增强版）
 
+> **v2.1 实现对齐说明（2026-09-03）**：本节已按实际代码更新。要点变更：
+> - 新增 **Desktop GUI**（`desktop/` 包）：DesktopServer + pywebview 原生窗口 + Web 前端（见 §6）
+> - 模型 Provider 实际只有 `OpenAIProvider`（OpenAI 兼容协议接入国产模型，"央企国产-only" 约束），AnthropicProvider 未实现
+> - 模型路由三档 LITE/DEFAULT/CRAFT 实际映射 `deepseek-chat` / `deepseek-v3` / `qwen-max`
+> - `SessionRunner.run()` 的实际签名接收 `Session` 对象（非 session_id）
+> - SessionStore 实际目录为 `sessions/`（元数据 JSON）+ `messages/`（消息 JSONL）；事件日志另由 harness `SessionLog` 持久化
+
 ## 1. 设计演进说明
 
 本模块在初版设计基础上，吸收了 opencode 的以下优秀设计：
@@ -101,211 +108,60 @@ class PromptPromotion:
             return eligible
 ```
 
-### 2.3 Session Runner
+### 2.3 Session Runner（实际实现见 Module 01 §2.4）
+
+`SessionRunner` 的权威实现在 [agent/drain.py](file:///f:/MyCoding/sdpost-claw/src/sdpost_claw/agent/drain.py)，完整描述见 Module 01 §2.4。本模块关注其与 Runtime 层的集成：
 
 ```python
 class SessionRunner:
-    """
-    会话运行器 - 借鉴 opencode 的 SessionRunner
+    """执行一次 Session Drain（实际签名）"""
 
-    负责执行一次 Session Drain
-    """
-
-    def __init__(
-        self,
-        session_store: SessionStore,
-        system_context: SystemContextRegistry,
-        tool_registry: ToolRegistry,
-        model_provider: ModelProvider,
-        permission_ruleset: PermissionRuleset,
-    ):
-        self.session_store = session_store
-        self.system_context = system_context
-        self.tool_registry = tool_registry
-        self.model_provider = model_provider
-        self.permission_ruleset = permission_ruleset
+    def __init__(self, tool_registry, permission_ruleset,
+                 model_provider=None, event_bus=None): ...
+    # 构造后注入协调器（Phase 4/5，保持 run 签名不变）：
+    #   system_context / compaction_bridge / summary_source
 
     async def run(
         self,
-        session_id: str,
+        session: Session,        # Session 对象（非 session_id）
+        system_context: str,
         force: bool = False,
+        on_delta: Any = None,    # 流式回调 (kind, chunk)：kind ∈ "text" | "reasoning"
     ) -> DrainResult:
-        """
-        执行一次 Session Drain
-
-        Args:
-            session_id: 会话 ID
-            force: 即使没有符合条件的工作也执行一次模型调用
-
-        Returns:
-            DrainResult: 执行结果
-        """
-        session = await self.session_store.get(session_id)
-        if not session:
-            raise SessionNotFoundError(session_id)
-
-        # 1. 准备 Safe Provider-Turn Boundary
-        boundary = SafeProviderTurnBoundary()
-        prepared = await boundary.prepare(session, self.system_context)
-
-        # 2. 检查是否有工作要做
-        if not force and not prepared.has_work():
-            return DrainResult(status="no_work")
-
-        # 3. 调用模型
-        response = await self.model_provider.generate(
-            system=prepared.system_context,
-            messages=prepared.messages,
-            tools=prepared.tools,
-        )
-
-        # 4. 处理响应
-        if response.has_tool_calls:
-            # 执行工具
-            results = await self._execute_tools(response.tool_calls, session)
-            return DrainResult(
-                status="tool_execution",
-                tool_calls=response.tool_calls,
-                tool_results=results,
-            )
-        else:
-            # 纯文本响应
-            return DrainResult(
-                status="text_response",
-                content=response.text,
-            )
-
-    async def _execute_tools(
-        self,
-        tool_calls: list[ToolCall],
-        session: Session,
-    ) -> list[ToolResult]:
-        """执行工具调用"""
-        results = []
-        for call in tool_calls:
-            # 权限检查
-            decision = self.permission_ruleset.evaluate(call.permission)
-            if decision.effect == "deny":
-                results.append(ToolResult(
-                    tool_call_id=call.id,
-                    name=call.name,
-                    content="Permission denied",
-                    is_error=True,
-                ))
-                continue
-
-            if decision.effect == "ask":
-                # 询问用户
-                answer = await self._ask_user(call)
-                if not answer:
-                    results.append(ToolResult(
-                        tool_call_id=call.id,
-                        name=call.name,
-                        content="User declined",
-                        is_error=True,
-                    ))
-                    continue
-
-            # 执行工具
-            tool = self.tool_registry.get(call.name)
-            if not tool:
-                results.append(ToolResult(
-                    tool_call_id=call.id,
-                    name=call.name,
-                    content=f"Unknown tool: {call.name}",
-                    is_error=True,
-                ))
-                continue
-
-            result = await tool.execute(call.input, ToolContext(
-                session_id=session.id,
-                agent=session.agent_id,
-                assistant_message_id=call.message_id,
-                tool_call_id=call.id,
-            ))
-            results.append(result)
-
-        return results
+        """每步内部完成：reconcile（Phase 4）→ 边界 prepare →
+        压缩压力检查（Phase 5）→ 模型调用（流式/一次性）→
+        工具执行（三阶段管道）或文本响应落历史"""
 ```
+
+所有客户端入口（终端 `run/exec`、Sidecar `serve`、桌面 `desktop`）都经由同一个 `SessionRunner.run()` 漏斗，reconcile 与压缩对所有入口一致生效。`DrainResult.status`：`no_work | tool_execution | text_response | error`。
 
 ---
 
 ## 3. Session Management v2
 
-### 3.1 会话生命周期
+### 3.1 会话生命周期（实际实现于 runtime/session.py）
+
+实际实现为三个协作类（[runtime/session.py](file:///f:/MyCoding/sdpost-claw/src/sdpost_claw/runtime/session.py)）：
 
 ```python
 class SessionLifecycle:
-    """
-    会话生命周期管理 - 借鉴 opencode 的 Session 设计
+    """会话生命周期状态机"""
+    # create(cwd, title, agent_mode) / get / update / close / list_all / delete
+    # 会话以 dict 形式持久化为 sessions/<id>.json，重启后可 resume
 
-    状态:
-    - ACTIVE: 活跃，可接收输入
-    - DRAINING: 正在执行 drain
-    - COMPACTING: 正在压缩
-    - EPOCH_TRANSITION: 纪元转换中
-    - CLOSED: 已关闭
-    """
+class SessionStore:
+    """文件存储（见 §3.2）"""
 
-    async def create(
-        self,
-        cwd: str,
-        title: str | None = None,
-        agent_mode: str = "build",
-    ) -> Session:
-        """创建新会话"""
-        session = Session(
-            id=generate_id(),
-            cwd=cwd,
-            title=title or "New Session",
-            agent_mode=agent_mode,
-            status=SessionStatus.ACTIVE,
-            created_at=datetime.now(),
-            context_epoch=ContextEpoch.initial(),
-        )
-
-        # 初始化 Context Epoch
-        generation = await self.system_context.initialize()
-        session.context_epoch = ContextEpoch(
-            id=generate_id(),
-            generation=generation,
-            started_at=datetime.now(),
-        )
-
-        await self.session_store.save(session)
-        return session
-
-    async def start_new_epoch(
-        self,
-        session: Session,
-        reason: str,
-    ) -> ContextEpoch:
-        """
-        开始新的 Context Epoch
-
-        触发原因:
-        - compaction: 压缩后
-        - migration: 会话迁移
-        - incompatible: 不兼容的上下文转换
-        """
-        # 结束当前纪元
-        old_epoch = session.context_epoch
-        old_epoch.ended_at = datetime.now()
-        old_epoch.end_reason = reason
-
-        # 创建新纪元
-        generation = await self.system_context.initialize()
-        new_epoch = ContextEpoch(
-            id=generate_id(),
-            generation=generation,
-            started_at=datetime.now(),
-        )
-
-        session.context_epoch = new_epoch
-        await self.session_store.save(session)
-
-        return new_epoch
+class SessionManager:
+    """运行时操作桥梁（SessionStore + SessionLifecycle 之上）"""
+    # create_session(cwd, title, agent_mode) -> Session（agent/drain.py 实体）
+    # get_session(session_id) -> Session | None（恢复 history）
+    # submit_prompt(session_id, text) -> Prompt（入 Inbox next_turn）
+    # add_assistant_message / add_assistant_tool_calls / add_tool_message
+    # persist_log(session)  # 将 SessionLog 增量落盘到事件日志 JSONL
 ```
+
+> **Context Epoch 集成现状**：`ContextEpoch` 类型已实现（context/epoch.py），但会话创建路径尚未持久化 epoch 记录；压缩摘要改经 Inbox 注入路径呈现（见 Module 03 §4），`start_new_epoch` 的持久化触发留待后续阶段。
 
 ### 3.2 会话存储
 
@@ -359,191 +215,166 @@ class SessionStore:
 
 ---
 
-## 4. Model Routing v2
+## 4. Model Routing v2（实际实现于 runtime/routing.py + runtime/providers.py）
 
-### 4.1 Provider-Turn Boundary 集成
+### 4.1 Provider 接口与国产模型适配
 
-```python
-class ModelRouter:
-    """
-    模型路由器 - 增强版，集成 Provider-Turn Boundary
-
-    在每次模型调用前确保:
-    1. 上下文已协调
-    2. 输入已推进
-    3. 工具结果已结算
-    """
-
-    def __init__(self):
-        self._providers: dict[str, ModelProvider] = {}
-        self._tiers: dict[str, str] = {
-            "LITE": "gpt-4o-mini",
-            "DEFAULT": "gpt-4o",
-            "CRAFT": "claude-sonnet-4-20250514",
-        }
-
-    def register(self, name: str, provider: ModelProvider):
-        """注册模型提供者"""
-        self._providers[name] = provider
-
-    async def generate(
-        self,
-        system: str,
-        messages: list[Message],
-        tools: list[ToolDefinition],
-        tier: str = "DEFAULT",
-    ) -> ModelResponse:
-        """
-        生成模型响应
-
-        Args:
-            system: 系统上下文（已协调）
-            messages: 消息历史（已推进）
-            tools: 可用工具
-            tier: 模型层级
-        """
-        model_name = self._tiers.get(tier, tier)
-        provider = self._providers.get(model_name)
-        if not provider:
-            raise ProviderNotFoundError(model_name)
-
-        return await provider.generate(
-            system=system,
-            messages=[m.to_dict() for m in messages],
-            tools=[t.to_dict() for t in tools],
-        )
-```
-
-### 4.2 模型提供者接口
+实际只有 `OpenAIProvider` 一种实现：所有国产大模型（DeepSeek、通义千问、智谱GLM、月之暗面、豆包、百川、MiniMax、阶跃星辰）均兼容 OpenAI 协议，统一走此实现（"央企国产-only" 约束）。`AnthropicProvider` 未实现。
 
 ```python
 class ModelProvider(ABC):
-    """模型提供者抽象"""
+    """模型提供者抽象（实际签名）"""
 
     @abstractmethod
-    async def generate(
-        self,
-        system: str,
-        messages: list[dict],
-        tools: list[dict] | None = None,
-    ) -> ModelResponse:
-        """生成响应"""
-        pass
+    async def generate(self, system: str, messages: list[dict],
+                       tools: list[dict] | None = None) -> ModelResponse: ...
+
+    async def generate_stream(self, system: str, messages: list[dict],
+                              tools: list[dict] | None = None,
+                              on_delta: Any = None) -> ModelResponse:
+        """流式生成。on_delta(kind, chunk)：kind ∈ "text" | "reasoning"。
+        默认退化为一次性 generate + 单个 delta。"""
 
     @abstractmethod
-    async def count_tokens(self, text: str) -> int:
-        """计算 token 数"""
-        pass
+    async def count_tokens(self, text: str) -> int: ...
+
 
 class OpenAIProvider(ModelProvider):
-    """OpenAI 兼容提供者"""
+    """OpenAI 兼容协议 Provider —— 适配所有国产大模型 API"""
 
-    def __init__(self, api_key: str, base_url: str | None = None):
-        self.client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+    async def generate_stream(self, system, messages, tools=None, on_delta=None):
+        # 解析 delta.content（text）与 delta.reasoning_content
+        # （DeepSeek-R1/GLM thinking 风格）增量输出
+        # stream_options={"include_usage": True} 收集 usage
+        # 流式被拒时降级为一次性 generate()
+        ...
 
-    async def generate(
-        self,
-        system: str,
-        messages: list[dict],
-        tools: list[dict] | None = None,
-    ) -> ModelResponse:
-        response = await self.client.chat.completions.create(
-            model=self.model,
-            messages=[{"role": "system", "content": system}] + messages,
-            tools=tools,
-        )
-        return ModelResponse.from_openai(response)
 
-class AnthropicProvider(ModelProvider):
-    """Anthropic 提供者"""
+def create_provider(provider_name, api_key, model=None, base_url=None) -> ModelProvider:
+    """工厂函数：统一返回 OpenAIProvider。
 
-    def __init__(self, api_key: str):
-        self.client = AsyncAnthropic(api_key=api_key)
-
-    async def generate(
-        self,
-        system: str,
-        messages: list[dict],
-        tools: list[dict] | None = None,
-    ) -> ModelResponse:
-        response = await self.client.messages.create(
-            model=self.model,
-            system=system,
-            messages=messages,
-            tools=tools,
-        )
-        return ModelResponse.from_anthropic(response)
+    - 缺少 base_url 时从厂商名映射默认地址
+      （deepseek → https://api.deepseek.com、阿里云 → dashscope compatible-mode 等）
+    - 未指定模型名时按厂商推荐默认值（deepseek→deepseek-chat、阿里云→qwen-max、智谱→glm-4-plus…）
+    - api_key 为空时走环境变量 OPENAI_API_KEY（本地端点如 Ollama 免 Key）
+    """
 ```
+
+### 4.2 分层路由 ModelRouter
+
+```python
+class ModelRouter:
+    """分层模型选择（runtime/routing.py，实际映射）"""
+
+    def __init__(self):
+        self._tiers: dict[str, str] = {"LITE": "deepseek", "DEFAULT": "deepseek", "CRAFT": "阿里云"}
+        self._tier_models: dict[str, str] = {
+            "LITE": "deepseek-chat",
+            "DEFAULT": "deepseek-v3",
+            "CRAFT": "qwen-max",
+        }
+
+    def set_tier(self, tier, provider_name, model=None): ...
+    async def generate(self, system, messages, tools=None, tier="DEFAULT"): ...
+    def select_tier_for_task(self, task_complexity: str = "normal") -> str:
+        # simple → LITE / normal → DEFAULT / complex → CRAFT
+```
+
+> **现状**：桌面端主链路（DesktopServer）当前直接使用 `create_provider` 创建的单 Provider（config.model 指定），`ModelRouter` 的三档路由能力已实现但尚未接入会话执行链路。
 
 ---
 
-## 5. JSONL Transcript v2
+## 5. JSONL Transcript v2（实际实现于 runtime/transcript.py + harness/session_log.py）
 
-### 5.1 事件溯源设计
+### 5.1 事件类型（实际 EventType 枚举）
 
 ```python
 class EventType(Enum):
-    """事件类型"""
     SESSION_CREATED = "session.created"
-    SESSION_EPOCH_CHANGED = "session.epoch_changed"
-    PROMPT_ADMITTED = "prompt.admitted"
-    TOOL_CALLED = "tool.called"
-    TOOL_RESULT_SETTLED = "tool.result_settled"
+    SESSION_RESUMED = "session.resumed"
+    SESSION_CLOSED = "session.closed"
+    PROMPT_SUBMITTED = "prompt.submitted"
+    MODEL_REQUEST = "model.request"
     MODEL_RESPONSE = "model.response"
+    TOOL_CALLED = "tool.called"
+    TOOL_RESULT = "tool.result"
     CONTEXT_UPDATED = "context.updated"
     COMPACTION = "compaction.occurred"
-
-@dataclass
-class Event:
-    """事件"""
-    type: EventType
-    session_id: str
-    timestamp: datetime
-    data: dict
-
-class JSONLTranscript:
-    """
-    JSONL 转录 - 增强版事件溯源
-
-    记录所有状态变更事件，支持:
-    - 会话重放
-    - 审计追踪
-    - 调试分析
-    """
-
-    def __init__(self, store: SessionStore):
-        self.store = store
-
-    async def record(self, event: Event):
-        """记录事件"""
-        await self.store.append_message(event.session_id, Message(
-            role="event",
-            content=json.dumps({
-                "type": event.type.value,
-                "timestamp": event.timestamp.isoformat(),
-                "data": event.data,
-            }),
-        ))
-
-    async def replay(self, session_id: str) -> list[Event]:
-        """重放会话"""
-        messages = await self.store.get_messages(session_id)
-        events = []
-        for msg in messages:
-            if msg.role == "event":
-                data = json.loads(msg.content)
-                events.append(Event(
-                    type=EventType(data["type"]),
-                    session_id=session_id,
-                    timestamp=datetime.fromisoformat(data["timestamp"]),
-                    data=data["data"],
-                ))
-        return events
+    ERROR = "error.occurred"
 ```
+
+### 5.2 JSONLTranscript（事件溯源）
+
+```python
+class JSONLTranscript:
+    """按会话写 transcripts/<session_id>.jsonl，支持 replay / 按类型过滤 / 清除"""
+
+    def __init__(self, base_path: Path): ...
+    async def record(self, event: TranscriptEvent) -> None: ...
+    async def record_simple(self, event_type, session_id, data=None) -> None: ...
+    async def replay(self, session_id: str) -> list[TranscriptEvent]: ...
+    async def get_events_by_type(self, session_id, event_type) -> list[TranscriptEvent]: ...
+```
+
+### 5.3 双层事件日志现状
+
+| 层 | 位置 | 角色 |
+|----|------|------|
+| harness `SessionLog` | harness/session_log.py | 会话内存中的 append-only 事件日志，是 `derive_messages()` 的权威数据源；`SessionManager.persist_log(session)` 将其增量落盘到 `messages/<session_id>.jsonl` |
+| runtime `JSONLTranscript` | runtime/transcript.py | 独立的事件溯源记录器（写 `transcripts/`），供审计/调试，尚未在桌面主链路默认启用 |
 
 ---
 
-## 6. 数据模型
+## 6. Desktop GUI（实际实现于 desktop/ 包）
+
+### 6.1 组件构成
+
+| 组件 | 文件 | 说明 |
+|------|------|------|
+| `DesktopApp` | desktop/app.py | pywebview 原生窗口包装器；`start_with_server()` 在后台线程起 SidecarServer 后打开指向 `http://127.0.0.1:8765/` 的原生窗口 |
+| `DesktopServer` | desktop/server.py | 集成应用服务器：aiohttp + 静态 Web UI 托管 + 全量 REST/SSE API |
+| Web 前端 | desktop/web/ | 原生 HTML/CSS/JS 聊天界面（SSE 消费端） |
+
+### 6.2 组装流程（DesktopServer.setup()）
+
+```python
+# 1. 注册 Context Sources（Date / ProjectInstructions / AgentInfo / SummaryContextSource）
+# 2. 注册内置工具 BuiltInTools.register_all(tool_registry, cwd)
+# 3. 注册技能源（bundled skills 目录 + config.skill_dirs）
+# 4. create_provider(...) 创建模型 Provider（缺 base_url/api_key 时从 DEFAULT_MODELS 条目回填）
+# 5. SessionRunner(tool_registry, _ruleset_for_mode(default_mode), model_provider)
+# 6. CompactionEngine(CompactionConfig()) + CompactionBridge(engine, provider)
+# 7. 注入协调器（Phase 4/5）：
+#    session_runner.system_context    = self.system_context
+#    session_runner.compaction_bridge = self._compaction_bridge
+#    session_runner.summary_source    = self._summary_source
+```
+
+### 6.3 HTTP API 一览
+
+| 路由 | 方法 | 说明 |
+|------|------|------|
+| `/` `/static/{path}` | GET | Web UI 与静态资源 |
+| `/api/health` | GET | 健康检查（model_configured / version） |
+| `/api/sessions` | GET / POST | 会话列表 / 创建 |
+| `/api/sessions/{id}` | GET / DELETE | 会话详情（含 history）/ 删除 |
+| `/api/sessions/{id}/prompt` | POST | 提交 Prompt（后台起 `_process_prompt` 任务） |
+| `/api/sessions/{id}/stream` | GET | SSE 事件流（带 per-session 缓冲重放，支持晚连接） |
+| `/api/fs/browse` | GET | 本地目录浏览（工作区选择器，Windows 盘符根） |
+| `/api/skills` `/api/experts` `/api/connectors` `/api/spaces` `/api/automations` `/api/library` | GET | 侧边栏 / 扩展数据（automations、library 为占位） |
+| `/api/config` | GET / POST | 配置读写（model / theme / compaction / skill_dirs 等；保存后刷新 SessionRunner.model_provider） |
+| `/api/models[...]` | GET / POST / PUT | 模型条目管理（增删改查、批量删除默认模型用 disabled override 隐藏） |
+| `/api/models/test` | POST | 直连 `/chat/completions` 测试连通性（本地端点免 Key） |
+
+### 6.4 处理循环与 SSE 事件
+
+`_process_prompt()`：`submit_prompt` → 后台任务中最多 20 次迭代调用 `session_runner.run(force=True, on_delta=...)`，按 `DrainResult.status` 分派（`tool_execution` 持续迭代并持久化 assistant tool_calls / tool 消息；`text_response` / `no_work` / `error` 结束）。收尾发布 `turn_stats`（duration/iterations/tool_calls/reasoning_chars）与 `done` 事件，并经 `_maybe_generate_title()` 自动生成会话标题（模型小调用，回退截取用户输入）。
+
+SSE 事件类型：`user | delta(kind: text/reasoning) | message | tool | turn_stats | title | done | connected`。
+
+---
+
+## 7. 数据模型
 
 ```python
 @dataclass
@@ -602,19 +433,21 @@ class ModelResponse:
     tool_calls: list[ToolCall] = field(default_factory=list)
     has_tool_calls: bool = False
     usage: dict | None = None
+    reasoning: str = ""   # DeepSeek-R1 / GLM thinking 风格的推理内容
 
 @dataclass
 class DrainResult:
     """Drain 执行结果"""
-    status: str  # "no_work" | "tool_execution" | "text_response"
+    status: str  # "no_work" | "tool_execution" | "text_response" | "error"
     content: str | None = None
+    error: str | None = None
     tool_calls: list[ToolCall] = field(default_factory=list)
     tool_results: list[ToolResult] = field(default_factory=list)
 ```
 
 ---
 
-## 7. 与其他模块的接口
+## 8. 与其他模块的接口
 
 | 接口 | 方向 | 说明 |
 |------|------|------|
@@ -627,16 +460,17 @@ class DrainResult:
 
 ---
 
-## 8. 实现计划
+## 9. 实现计划
 
-| 阶段 | 内容 | 产出 |
+| 阶段 | 内容 | 状态 |
 |------|------|------|
-| Phase 1 | Session Drain 基础 | 单次 drain 执行 |
-| Phase 2 | Prompt Promotion | 输入推进机制 |
-| Phase 3 | Context Epoch 集成 | 纪元管理 |
-| Phase 4 | JSONL 事件溯源 | 完整事件记录 |
-| Phase 5 | Model Routing 增强 | 多模型支持 |
+| Phase 1 | Session Drain 基础 | ✅ 已完成（agent/drain.py + harness/driver.py） |
+| Phase 2 | Prompt Promotion + Inbox 双队列 | ✅ 已完成（agent/drain.py + harness/inbox.py） |
+| Phase 3 | Context Epoch 集成 | ⚠️ 类型已实现，epoch 持久化触发待接入 |
+| Phase 4 | reconcile + Inbox 注入路径 | ✅ 已完成（SessionRunner 内嵌，Phase 4） |
+| Phase 5 | Compaction Bridge + Summary 注入 | ✅ 已完成（Phase 5，surface op replace 留后续） |
+| Phase 6 | Desktop GUI | ✅ 已完成（desktop/ 包） |
 
 ---
 
-*文档版本: v2.0 | 创建日期: 2026-08-27 | 基于 opencode 架构优化*
+*文档版本: v2.1 | 创建日期: 2026-08-27 | 最近更新: 2026-09-03 | 基于 opencode 架构优化*

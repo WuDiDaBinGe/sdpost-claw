@@ -19,11 +19,13 @@ from sdpost_claw.config import DEFAULT_MODELS, get_config, ModelEntry
 from sdpost_claw.context.compaction import CompactionConfig, CompactionEngine
 from sdpost_claw.context.registry import SystemContextRegistry
 from sdpost_claw.context.source import (
+    AgentSkillsContextSource,
     DateContextSource,
     ProjectInstructionsContextSource,
     AgentContextSource,
     SummaryContextSource,
 )
+from sdpost_claw.context.source import SkillInfo as ContextSkillInfo
 from sdpost_claw.extensions.experts import ExpertRegistry
 from sdpost_claw.extensions.skills import SkillRegistry, SkillSource
 from sdpost_claw.harness.compaction_bridge import CompactionBridge
@@ -76,6 +78,8 @@ class DesktopServer:
         self.session_manager = SessionManager(self.session_store)
         self.model_provider = None
         self.session_runner = None
+        self._compaction_engine: CompactionEngine | None = None
+        self._compaction_bridge: CompactionBridge | None = None
 
         # Extension registries
         self.skill_registry = SkillRegistry()
@@ -116,36 +120,10 @@ class DesktopServer:
             if p.exists():
                 self.skill_registry.add_source(SkillSource.directory(p))
 
-        # Setup model provider. If the legacy config.model block lacks
-        # base_url / api_key (e.g. written by an older UI that only saved
-        # provider+model), resolve them from the matching model entry.
-        provider_name = self.config.model.provider
-        model_name = self.config.model.model
-        api_key = self.config.model.api_key
-        base_url = self.config.model.base_url
-        if not base_url or not api_key:
-            entry = next(
-                (m for m in self.config.all_models
-                 if m.model == model_name or m.id == model_name),
-                None,
-            )
-            if entry:
-                if not base_url:
-                    base_url = entry.base_url or None
-                if not api_key:
-                    api_key = entry.api_key
-        try:
-            self.model_provider = create_provider(
-                provider_name=provider_name,
-                api_key=api_key,
-                model=model_name,
-                base_url=base_url,
-            )
-            # Persist the resolved credentials back so they survive restart
-            self.config.model.api_key = api_key
-            self.config.model.base_url = base_url
-        except Exception as e:
-            print(f"Warning: Model provider not configured: {e}")
+        # Setup model provider. Resolve credentials from the matching
+        # ModelEntry if config.model lacks base_url / api_key (e.g.
+        # written by an older UI that only saved provider+model).
+        self._sync_active_provider()
 
         # Create session runner
         self.session_runner = SessionRunner(
@@ -222,17 +200,29 @@ class DesktopServer:
     # Web UI handlers
     # ------------------------------------------------------------------
     async def handle_index_page(self, request: web.Request) -> web.Response:
-        """Serve index.html."""
-        return web.FileResponse(WEB_DIR / "index.html")
+        """Serve index.html. no-store: WebView2 caches aggressively and
+        would otherwise keep serving a stale page after code updates."""
+        return web.FileResponse(
+            WEB_DIR / "index.html",
+            headers={"Cache-Control": "no-store"},
+        )
 
     async def handle_static(self, request: web.Request) -> web.Response:
-        """Serve static assets (css/js)."""
+        """Serve static assets (css/js). no-store: WebView2 caches
+        aggressively and would otherwise keep running a stale app.js
+        even after a desktop restart."""
         rel = request.match_info["path"]
         path = (WEB_DIR / rel).resolve()
         if not str(path).startswith(str(WEB_DIR.resolve())) or not path.exists():
             return web.Response(status=404)
         ctype, _ = mimetypes.guess_type(str(path))
-        return web.FileResponse(path, headers={"Content-Type": ctype or "application/octet-stream"})
+        return web.FileResponse(
+            path,
+            headers={
+                "Content-Type": ctype or "application/octet-stream",
+                "Cache-Control": "no-store",
+            },
+        )
 
     # ------------------------------------------------------------------
     # API handlers
@@ -303,6 +293,30 @@ class DesktopServer:
 
         return web.json_response({"status": "processing"})
 
+    async def _ensure_skills_in_context(self) -> None:
+        """Lazily register discovered skills as an agent/skills context source.
+
+        Runs once, on the first prompt: skill discovery is async (file/URL
+        IO) while ``setup()`` is sync. After registration the skill list
+        (with slash commands rendered as ``/name``) is part of the system
+        context baseline, so ``/<skill>`` input can be resolved by the model.
+        """
+        if getattr(self, "_skills_in_context", False):
+            return
+        self._skills_in_context = True
+        try:
+            skills = await self.skill_registry.list_all()
+        except Exception:
+            skills = []
+        if not skills:
+            return
+        self.system_context.register(AgentSkillsContextSource(
+            skills=[
+                ContextSkillInfo(name=s.name, description=s.description, slash=s.slash)
+                for s in skills
+            ]
+        ))
+
     async def _process_prompt(self, session: Session, text: str) -> None:
         """Process prompt through agent loop and stream events."""
         # Per-turn statistics (deepseek-harness style): tools / iterations / duration
@@ -345,10 +359,25 @@ class DesktopServer:
 
         # Initialize context
         try:
+            await self._ensure_skills_in_context()
             generation = await self.system_context.initialize()
             system_context = generation.baseline
         except Exception:
             system_context = "You are sdpost-claw, an AI office assistant."
+
+        # Input conventions for the chat box: @file mentions and /skill
+        # slash commands (inserted by the web UI autocomplete; both may
+        # appear multiple times per message).
+        system_context += (
+            "\n\n## Input Conventions\n"
+            "- One or more '@<path>' tokens in a user message reference "
+            "local files or directories. Use the read/glob/grep tools to "
+            "inspect each referenced path before answering.\n"
+            "- One or more '/<name>' tokens invoke the slash skills with "
+            "those names from the Available Skills list. Apply each "
+            "invoked skill's instructions to handle the rest of the "
+            "message."
+        )
 
         # Agent loop
         max_iterations = 20
@@ -559,15 +588,22 @@ class DesktopServer:
             return web.json_response({"error": f"not a directory: {raw}"}, status=400)
 
         dirs: list[dict[str, str]] = []
+        files: list[dict[str, str]] = []
         try:
-            for d in sorted(p.iterdir(), key=lambda x: x.name.lower()):
-                if d.is_dir() and not d.name.startswith("."):
-                    dirs.append({"name": d.name, "path": str(d)})
+            for entry in sorted(p.iterdir(), key=lambda x: x.name.lower()):
+                if entry.name.startswith("."):
+                    continue
+                if entry.is_dir():
+                    if len(dirs) < 500:
+                        dirs.append({"name": entry.name, "path": str(entry)})
+                elif entry.is_file():
+                    if len(files) < 500:
+                        files.append({"name": entry.name, "path": str(entry)})
         except OSError as e:
             return web.json_response({"error": f"cannot list: {e}"}, status=400)
 
         parent = str(p.parent) if p.parent != p else ""
-        return web.json_response({"path": str(p), "parent": parent, "dirs": dirs})
+        return web.json_response({"path": str(p), "parent": parent, "dirs": dirs, "files": files})
 
     async def handle_list_spaces(self, request: web.Request) -> web.Response:
         """List workspaces/spaces derived from session cwds."""
@@ -637,6 +673,10 @@ class DesktopServer:
         data = await request.json()
 
         if "model_id" in data:
+            # Explicit user switch from the chat UI model dropdown.
+            # Any configured entry is switchable; on failure (e.g. the
+            # entry has no api_key) revert to the previous model so the
+            # UI and the actual provider never diverge.
             entry = next(
                 (m for m in self.config.all_models if m.id == data["model_id"]),
                 None,
@@ -645,10 +685,24 @@ class DesktopServer:
                 return web.json_response(
                     {"error": f"未找到模型: {data['model_id']}"}, status=404
                 )
-            self.config.model.provider = entry.provider
-            self.config.model.model = entry.model
-            self.config.model.api_key = entry.api_key
-            self.config.model.base_url = entry.base_url or None
+            cm = self.config.model
+            prev = (cm.provider, cm.model, cm.api_key, cm.base_url)
+            cm.provider = entry.provider
+            cm.model = entry.model
+            cm.api_key = entry.api_key
+            cm.base_url = entry.base_url or None
+            self.config.save()
+            switch_error = self._sync_active_provider(allow_adopt=False)
+            if switch_error:
+                # Revert — chat keeps using the previous working model.
+                cm.provider, cm.model, cm.api_key, cm.base_url = prev
+                self.config.save()
+                self._sync_active_provider(allow_adopt=False)
+                return web.json_response({
+                    "status": "error",
+                    "error": f"切换失败（{entry.name} 未配置 API Key），已保留原模型",
+                    "provider_error": switch_error,
+                }, status=400)
         else:
             if "provider" in data:
                 self.config.model.provider = data["provider"]
@@ -683,23 +737,7 @@ class DesktopServer:
             self.config.audit_enabled = bool(data["audit_enabled"])
 
         self.config.save()
-
-        # Re-setup model provider
-        error: str | None = None
-        try:
-            self.model_provider = create_provider(
-                provider_name=self.config.model.provider,
-                api_key=self.config.model.api_key,
-                model=self.config.model.model,
-                base_url=self.config.model.base_url,
-            )
-            # CRITICAL: SessionRunner holds a provider reference captured
-            # at startup — it must be refreshed or chat keeps using the
-            # stale (possibly None) provider.
-            if self.session_runner is not None:
-                self.session_runner.model_provider = self.model_provider
-        except Exception as e:
-            error = str(e)
+        error = self._sync_active_provider()
 
         return web.json_response({
             "status": "updated",
@@ -709,9 +747,144 @@ class DesktopServer:
             "provider_error": error,
         })
 
+    def _sync_active_provider(self, allow_adopt: bool = True) -> str | None:
+        """Ensure the active model provider matches config + models entries.
+
+        Called after ``setup()`` (initial sync), after ``save_config``
+        (direct edit of config.model), and after ``add/update_model``
+        (indirect change — when the edited entry is the active model).
+
+        1. If ``config.model`` lacks ``api_key`` / ``base_url``, backfill
+           from the matching ModelEntry (so credentials set in the model
+           list UI actually reach the provider that chat uses).
+        2. Recreate ``self.model_provider`` with the resolved credentials.
+        3. Reassign ``self.session_runner.model_provider`` — ``SessionRunner``
+           keeps a captured reference and won't see a new provider otherwise.
+
+        ``allow_adopt=False`` (explicit user switch): never fall back to a
+        DIFFERENT model's credentials — switching to a keyless entry is an
+        error, not a silent substitution. The startup/first-run path uses
+        the default ``allow_adopt=True``.
+
+        Returns a user-facing error string on failure, or None on success.
+        """
+        provider_name = self.config.model.provider
+        model_name = self.config.model.model
+        api_key = self.config.model.api_key
+        base_url = self.config.model.base_url
+
+        if not base_url or not api_key:
+            entry = next(
+                (m for m in self.config.all_models
+                 if m.model == model_name or m.id == model_name),
+                None,
+            )
+            if entry:
+                changed = False
+                if not base_url and entry.base_url:
+                    base_url = entry.base_url
+                    self.config.model.base_url = base_url
+                    changed = True
+                if not api_key and entry.api_key:
+                    api_key = entry.api_key
+                    self.config.model.api_key = api_key
+                    changed = True
+                if not provider_name and entry.provider:
+                    provider_name = entry.provider
+                    self.config.model.provider = provider_name
+                    changed = True
+                if changed:
+                    self.config.save()
+
+        if not api_key and allow_adopt:
+            # Fallback: no key on the active model — adopt the first
+            # enabled entry that HAS one (covers keys saved on a
+            # non-active entry by older versions of the UI). Only for
+            # startup/first-run; explicit switches must not silently
+            # substitute a different model.
+            entry = next(
+                (m for m in self.config.all_models if m.api_key and m.enabled),
+                None,
+            )
+            if entry:
+                provider_name = entry.provider
+                model_name = entry.model
+                api_key = entry.api_key
+                base_url = entry.base_url or None
+                self.config.model.provider = provider_name
+                self.config.model.model = model_name
+                self.config.model.api_key = api_key
+                self.config.model.base_url = base_url
+                self.config.save()
+
+        if not api_key:
+            msg = "active model has no api_key configured"
+            print(f"Warning: {msg}")
+            return msg
+
+        try:
+            self.model_provider = create_provider(
+                provider_name=provider_name,
+                api_key=api_key,
+                model=model_name,
+                base_url=base_url,
+            )
+            if self.session_runner is not None:
+                self.session_runner.model_provider = self.model_provider
+            # Also refresh compaction bridge — it holds the same provider
+            # reference for summary generation.
+            if self._compaction_bridge is not None:
+                self._compaction_bridge.provider = self.model_provider
+            print(f"Model provider synced: {provider_name} / {model_name}")
+            return None
+        except Exception as e:
+            msg = str(e)
+            print(f"Warning: Model provider sync failed: {msg}")
+            return msg
+
+    def _active_model_matches(self, entry: ModelEntry) -> bool:
+        """True if the saved entry is the one DesktopServer currently uses."""
+        cm = self.config.model
+        return (
+            entry.model == cm.model
+            or entry.id == cm.model
+            or (entry.provider and cm.provider and entry.provider == cm.provider and entry.model == cm.model)
+        )
+
+    def _maybe_adopt_entry(self, entry: ModelEntry) -> None:
+        """Sync the provider after a model entry was saved.
+
+        Two cases trigger a sync:
+        1. The entry IS the active model — credentials may have changed.
+        2. The active model has NO api_key while this entry HAS one —
+           adopt it as the active model. Without this, a user who
+           configures a key on a non-default model entry (e.g. qwen-plus
+           while active is the keyless deepseek-chat default) would keep
+           getting "未配置模型提供商" — the key never reached the provider.
+        """
+        if self._active_model_matches(entry):
+            self._sync_active_provider()
+            return
+        if entry.api_key and not self.config.model.api_key:
+            self.config.model.provider = entry.provider
+            self.config.model.model = entry.model
+            self.config.model.api_key = entry.api_key
+            self.config.model.base_url = entry.base_url or None
+            self.config.save()
+            self._sync_active_provider()
+
     # ------------------------------------------------------------------
     # Model Management (model-level, each entry = one model)
     # ------------------------------------------------------------------
+    @staticmethod
+    def _mask_api_key(key: str) -> str:
+        """Mask an API key for display: keep a short head/tail only."""
+        if not key:
+            return ""
+        if len(key) <= 8:
+            return "****"
+        return f"{key[:3]}****{key[-4:]}"
+
     async def handle_list_models(self, request: web.Request) -> web.Response:
         """List all models (defaults + user-configured)."""
         models = self.config.all_models
@@ -723,6 +896,7 @@ class DesktopServer:
                 "provider": m.provider,
                 "model": m.model,
                 "api_key_set": bool(m.api_key),
+                "api_key_masked": self._mask_api_key(m.api_key),
                 "base_url": m.base_url,
                 "enabled": m.enabled,
             })
@@ -741,6 +915,7 @@ class DesktopServer:
             "provider": target.provider,
             "model": target.model,
             "api_key_set": bool(target.api_key),
+            "api_key_masked": self._mask_api_key(target.api_key),
             "base_url": target.base_url,
             "enabled": target.enabled,
         })
@@ -771,18 +946,26 @@ class DesktopServer:
             self.config.models.append(entry)
 
         self.config.save()
+        self._maybe_adopt_entry(entry)
         return web.json_response({"status": "saved", "id": mid})
 
     async def handle_update_model(self, request: web.Request) -> web.Response:
         """Update an existing model entry.
 
-        If the model is a default (not yet in self.config.models),
-        promote it to a user-configured entry so changes persist.
+        Supports renaming via the ``id`` field in the request body (when
+        it differs from the path param). Renames are tracked in the
+        session config too — ``config.model.model`` / ``config.model.id``
+        references the active model and must be kept consistent so the
+        next ``_sync_active_provider`` can still find the matching entry.
+
+        If the model is a default (not yet in ``config.models``), promote
+        it to a user-configured entry so changes persist.
         """
         model_id = request.match_info["model_id"]
         data = await request.json()
 
         existing = [m for m in self.config.models if m.id == model_id]
+
         if existing:
             entry = existing[0]
             i = self.config.models.index(entry)
@@ -792,20 +975,32 @@ class DesktopServer:
                 entry.provider = data["provider"]
             if "model" in data:
                 entry.model = data["model"]
-            if "api_key" in data:
+            # Empty api_key means "keep the existing key" (the edit form
+            # leaves the field blank when a key is already configured).
+            if data.get("api_key"):
                 entry.api_key = data["api_key"]
             if "base_url" in data:
                 entry.base_url = data["base_url"]
             if "enabled" in data:
                 entry.enabled = data["enabled"]
+            # Rename the entry ID if the user changed it in the form.
+            # _sync_active_provider locates entries by model NAME (not ID),
+            # so renaming the entry ID alone never requires touching
+            # config.model — provider sync is unaffected.
+            new_id = data.get("id", "").strip()
+            if new_id and new_id != model_id:
+                if any(m.id == new_id for m in self.config.models):
+                    return web.json_response({"error": f"Model ID '{new_id}' already exists"}, status=409)
+                entry.id = new_id
             self.config.models[i] = entry
         else:
             # Promote default model to user-configured so it persists
+            new_id = data.get("id", "").strip() or model_id
             entry = ModelEntry(
-                id=model_id,
-                name=data.get("name", model_id),
+                id=new_id,
+                name=data.get("name", new_id),
                 provider=data.get("provider", ""),
-                model=data.get("model", model_id),
+                model=data.get("model", new_id),
                 api_key=data.get("api_key", ""),
                 base_url=data.get("base_url", ""),
                 enabled=data.get("enabled", True),
@@ -813,7 +1008,8 @@ class DesktopServer:
             self.config.models.append(entry)
 
         self.config.save()
-        return web.json_response({"status": "updated", "id": model_id})
+        self._maybe_adopt_entry(entry)
+        return web.json_response({"status": "updated", "id": entry.id})
 
     async def handle_batch_delete_models(self, request: web.Request) -> web.Response:
         """Batch delete model entries.

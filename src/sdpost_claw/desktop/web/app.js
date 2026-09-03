@@ -36,7 +36,15 @@ let tickerIndex = 0;
 /* ---------- API helpers ---------- */
 async function api(path, opts) {
     const resp = await fetch(path, opts);
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    if (!resp.ok) {
+        // Surface backend error messages (e.g. model switch failures)
+        let msg = `HTTP ${resp.status}`;
+        try {
+            const body = await resp.json();
+            if (body.error) msg = body.error;
+        } catch (_) {}
+        throw new Error(msg);
+    }
     return resp.json();
 }
 
@@ -108,12 +116,34 @@ function renderQuickEntries() {
 function bindEvents() {
     document.getElementById('sendBtn').onclick = sendMessage;
     document.getElementById('inputBox').addEventListener('keydown', e => {
+        if (mention.open) {
+            if (e.key === 'ArrowDown') { e.preventDefault(); moveMentionHighlight(1); return; }
+            if (e.key === 'ArrowUp') { e.preventDefault(); moveMentionHighlight(-1); return; }
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                if (e.ctrlKey || e.metaKey) { applyMentionSelection(); return; }
+                const r = mention.rows[mention.highlight];
+                if (!r) return;
+                if (r.kind === 'dir') toggleExpand(r.path);
+                else toggleSelect(r);
+                return;
+            }
+            if (e.key === 'Tab') { e.preventDefault(); applyMentionSelection(); return; }
+            if (e.key === 'Escape') { e.preventDefault(); closeMention(); return; }
+        }
         if (e.key === 'Enter' && !e.shiftKey) {
             e.preventDefault();
             sendMessage();
         }
     });
-    document.getElementById('inputBox').addEventListener('input', autoResize);
+    document.getElementById('inputBox').addEventListener('input', () => {
+        autoResize();
+        handleMentionInput();
+    });
+    document.getElementById('inputBox').addEventListener('blur', () => {
+        // delay so popup clicks can land before the popup closes
+        setTimeout(() => { if (!mention.mouseOverPopup) closeMention(); }, 150);
+    });
     document.getElementById('clearBtn').onclick = clearChat;
     document.getElementById('scrollTopBtn').onclick = () =>
         document.getElementById('chatScroll').scrollTo({ top: 0, behavior: 'smooth' });
@@ -162,6 +192,23 @@ function bindEvents() {
 
     document.getElementById('taskTitle').onclick = () => toggleSection('taskList');
 
+    // User popup menu (settings entry)
+    const userCard = document.getElementById('userCard');
+    const userMenu = document.getElementById('userMenu');
+    userCard.onclick = e => {
+        e.stopPropagation();
+        userMenu.classList.toggle('hidden');
+    };
+    document.addEventListener('click', e => {
+        if (!userMenu.classList.contains('hidden') && !userMenu.contains(e.target)) {
+            userMenu.classList.add('hidden');
+        }
+    });
+    document.getElementById('menuSettingsBtn').onclick = () => {
+        userMenu.classList.add('hidden');
+        openListView('settings');
+    };
+
     // Model modal events
     document.getElementById('modelModalClose').onclick = closeModelModal;
     document.getElementById('modelModal').addEventListener('click', (e) => {
@@ -170,15 +217,265 @@ function bindEvents() {
         }
     });
     document.getElementById('toggleApiKeyBtn').onclick = toggleApiKeyVisibility;
+    document.getElementById('editModelApiKey').addEventListener('input', () => {
+        apiKeyPristine = false;
+    });
     document.getElementById('testModelBtn').onclick = testModel;
     document.getElementById('deleteModelBtn').onclick = deleteModel;
     document.getElementById('saveModelBtn').onclick = saveModel;
 }
 
 function autoResize(e) {
-    const el = e.target;
+    const el = e.target || document.getElementById('inputBox');
     el.style.height = 'auto';
     el.style.height = Math.min(el.scrollHeight, 120) + 'px';
+}
+
+/* ---------- Mention autocomplete: @files (dir tree, multi-select) and /skills (multi-select) ---------- */
+const mention = {
+    open: false,
+    mode: null,            // 'file' | 'skill'
+    tokenStart: -1,        // index of '@' or leading '/'
+    query: '',
+    // file mode: lazy-loaded directory tree rooted at the workspace
+    rootPath: null,
+    nodes: {},             // normalized path -> {dirs, files}
+    expanded: new Set(),   // normalized paths of expanded dirs
+    // skill mode
+    skillsCache: null,
+    // common UI state
+    rows: [],              // visible rows after filter
+    highlight: 0,
+    selected: new Map(),   // rowKey -> insert token
+    mouseOverPopup: false,
+};
+
+function mentionPopupEl() { return document.getElementById('mentionPopup'); }
+
+function normalizeKey(p) { return String(p).replace(/\\/g, '/').toLowerCase(); }
+
+function closeMention() {
+    mention.open = false;
+    mention.mode = null;
+    mention.rows = [];
+    mention.selected.clear();
+    mention.expanded.clear();
+    mention.tokenStart = -1;
+    mention.mouseOverPopup = false;
+    mentionPopupEl().classList.add('hidden');
+}
+
+/* Detect the mention token the caret is currently inside (if any).
+   Accepts both ASCII and full-width forms: @/＠ for files, //、/、／ for
+   skills (Chinese IMEs commonly produce ＠ and ／). */
+function currentMentionToken() {
+    const box = document.getElementById('inputBox');
+    const pos = box.selectionStart;
+    const before = box.value.slice(0, pos);
+    const sm = before.match(/^[/／]{1,2}([^\s]*)$/);
+    if (sm) return { mode: 'skill', query: sm[1], start: 0 };
+    const fm = before.match(/(?:^|\s)[@＠]([^\s＠@]*)$/);
+    if (fm) return { mode: 'file', query: fm[1], start: pos - fm[1].length - 1 };
+    return null;
+}
+
+async function handleMentionInput() {
+    const tok = currentMentionToken();
+    if (!tok) { closeMention(); return; }
+
+    if (!mention.open || mention.mode !== tok.mode) {
+        // Fresh open: reset state, init data source
+        closeMention();
+        mention.open = true;
+        mention.mode = tok.mode;
+        mention.query = tok.query;
+        mention.tokenStart = tok.start;
+        if (tok.mode === 'file') await initFileTree();
+        else await loadSkills();
+    } else {
+        mention.query = tok.query;
+        mention.tokenStart = tok.start;
+    }
+    await renderMentionPopup();
+}
+
+/* ---------- file mode: lazy directory tree ---------- */
+async function initFileTree() {
+    mention.rootPath = null;
+    mention.nodes = {};
+    mention.expanded = new Set();
+    const start = (state.workspace && state.workspace !== '.') ? state.workspace : '.';
+    try {
+        const data = await api('/api/fs/browse?path=' + encodeURIComponent(start));
+        mention.rootPath = data.path || start;
+        mention.nodes[normalizeKey(mention.rootPath)] = {
+            dirs: data.dirs || [], files: data.files || [],
+        };
+    } catch (e) {
+        mention.rootPath = null;
+    }
+}
+
+async function ensureNode(dirPath) {
+    const key = normalizeKey(dirPath);
+    if (mention.nodes[key]) return mention.nodes[key];
+    try {
+        const data = await api('/api/fs/browse?path=' + encodeURIComponent(dirPath));
+        mention.nodes[key] = { dirs: data.dirs || [], files: data.files || [] };
+    } catch (e) {
+        mention.nodes[key] = { dirs: [], files: [] };
+    }
+    return mention.nodes[key];
+}
+
+async function toggleExpand(path) {
+    const key = normalizeKey(path);
+    if (mention.expanded.has(key)) {
+        mention.expanded.delete(key);
+    } else {
+        mention.expanded.add(key);
+        await ensureNode(path);
+    }
+    await renderMentionPopup();
+}
+
+/* Visible rows: DFS from root, filtered by the trailing name segment of the query. */
+function buildFileRows() {
+    const rows = [];
+    if (!mention.rootPath) return rows;
+    const q = mention.query.split(/[\\/]/).pop().toLowerCase();
+    const walk = (dirPath, depth) => {
+        const node = mention.nodes[normalizeKey(dirPath)];
+        if (!node) return;
+        node.dirs.forEach(d => {
+            if (!q || d.name.toLowerCase().includes(q))
+                rows.push({ kind: 'dir', name: d.name, path: d.path, depth });
+        });
+        node.files.forEach(f => {
+            if (!q || f.name.toLowerCase().includes(q))
+                rows.push({ kind: 'file', name: f.name, path: f.path, depth });
+        });
+        node.dirs.forEach(d => {
+            if (mention.expanded.has(normalizeKey(d.path))) walk(d.path, depth + 1);
+        });
+    };
+    walk(mention.rootPath, 0);
+    return rows;
+}
+
+/* ---------- skill mode ---------- */
+async function loadSkills() {
+    if (mention.skillsCache) return;
+    try {
+        const { skills } = await api('/api/skills');
+        mention.skillsCache = skills || [];
+    } catch (e) {
+        mention.skillsCache = [];
+    }
+}
+
+function buildSkillRows() {
+    const q = mention.query.toLowerCase();
+    return (mention.skillsCache || [])
+        .filter(s => s.name.toLowerCase().includes(q))
+        .map(s => ({ kind: 'skill', name: s.name, path: s.name, depth: 0, desc: s.description || '' }));
+}
+
+/* ---------- selection & insert ---------- */
+function rowKey(r) {
+    return mention.mode === 'skill' ? 'skill:' + r.name : normalizeKey(r.path);
+}
+
+async function toggleSelect(r) {
+    const key = rowKey(r);
+    if (mention.selected.has(key)) {
+        mention.selected.delete(key);
+    } else {
+        mention.selected.set(key, mention.mode === 'skill' ? '/' + r.name : '@' + r.path);
+    }
+    await renderMentionPopup();
+}
+
+function applyMentionSelection() {
+    if (!mention.selected.size) return;
+    const box = document.getElementById('inputBox');
+    const inserts = Array.from(mention.selected.values());
+    const joined = inserts.join(' ');
+    const pos = box.selectionStart;
+    box.value = box.value.slice(0, mention.tokenStart) + joined + ' ' + box.value.slice(pos);
+    const newPos = mention.tokenStart + joined.length + 1;
+    box.focus();
+    box.setSelectionRange(newPos, newPos);
+    closeMention();
+    autoResize();
+}
+
+/* ---------- rendering ---------- */
+async function renderMentionPopup() {
+    const popup = mentionPopupEl();
+    if (!mention.open) return;
+
+    mention.rows = mention.mode === 'file' ? buildFileRows() : buildSkillRows();
+    if (mention.highlight >= mention.rows.length) mention.highlight = 0;
+
+    const isFile = mention.mode === 'file';
+    const title = isFile
+        ? '引用本地文件' + (mention.rootPath ? ' · ' + mention.rootPath : '')
+        : '调用技能';
+    const hint = isFile
+        ? '点击文件夹展开 · 点击行多选 · Tab 插入'
+        : '点击技能多选 · Tab 插入';
+    const selCount = mention.selected.size;
+
+    let html = `<div class="mention-head"><span class="mention-title" title="${escapeHtml(title)}">${escapeHtml(title)}</span><span class="mention-hint">${escapeHtml(hint)}</span></div>`;
+    html += '<div class="mention-body">';
+    if (!mention.rows.length) {
+        html += '<div class="mention-empty">无匹配项</div>';
+    } else {
+        html += mention.rows.map((r, i) => {
+            const sel = mention.selected.has(rowKey(r));
+            const icon = r.kind === 'dir'
+                ? (mention.expanded.has(normalizeKey(r.path)) ? '📂' : '📁')
+                : (r.kind === 'file' ? '📄' : '⭐');
+            const cls = 'mention-row' + (i === mention.highlight ? ' hl' : '') + (sel ? ' sel' : '');
+            return `<div class="${cls}" data-i="${i}" style="padding-left:${8 + r.depth * 14}px">
+                <span class="mention-check">${sel ? '☑' : '☐'}</span>
+                <span class="mention-icon">${icon}</span>
+                <span class="mention-name">${escapeHtml(r.name)}</span>
+                ${r.desc ? `<span class="mention-desc">${escapeHtml(r.desc)}</span>` : ''}
+            </div>`;
+        }).join('');
+    }
+    html += '</div>';
+    html += `<div class="mention-foot">
+        <span class="mention-count">${selCount ? '已选 ' + selCount + ' 项' : '未选择'}</span>
+        <button class="mention-insert-btn" id="mentionInsertBtn" ${selCount ? '' : 'disabled'}>插入${selCount ? '（' + selCount + '）' : ''}</button>
+    </div>`;
+
+    popup.innerHTML = html;
+    popup.classList.remove('hidden');
+    popup.onmouseenter = () => { mention.mouseOverPopup = true; };
+    popup.onmouseleave = () => { mention.mouseOverPopup = false; };
+
+    popup.querySelectorAll('.mention-row').forEach(el => {
+        el.onclick = async () => {
+            const i = Number(el.dataset.i);
+            const r = mention.rows[i];
+            mention.highlight = i;
+            if (r.kind === 'dir') await toggleExpand(r.path);
+            else await toggleSelect(r);
+        };
+    });
+    const btn = popup.querySelector('#mentionInsertBtn');
+    if (btn) btn.onclick = applyMentionSelection;
+}
+
+function moveMentionHighlight(delta) {
+    if (!mention.rows.length) return;
+    mention.highlight = (mention.highlight + delta + mention.rows.length) % mention.rows.length;
+    renderMentionPopup();
+    const active = mentionPopupEl().querySelector('.mention-row.hl');
+    if (active) active.scrollIntoView({ block: 'nearest' });
 }
 
 /* ---------- Nav switching ---------- */
@@ -198,6 +495,22 @@ function switchNav(btn) {
         renderList(key);
     }
 }
+
+/* Open a list view that has no sidebar nav entry (e.g. settings). */
+function openListView(key) {
+    document.querySelectorAll('.nav-item').forEach(b => b.classList.remove('active'));
+    document.getElementById('viewChat').classList.add('hidden');
+    document.getElementById('viewList').classList.remove('hidden');
+    renderList(key);
+}
+
+/* ---------- Experts page (tabbed: experts / skills / connectors) ---------- */
+let expertsTab = 'experts';
+const EXPERTS_TABS = [
+    { key: 'experts',    label: '专家' },
+    { key: 'skills',     label: '技能' },
+    { key: 'connectors', label: '连接器' },
+];
 
 async function renderList(key) {
     const header = document.getElementById('listHeader');
@@ -229,49 +542,44 @@ async function renderList(key) {
             );
         } else if (key === 'experts') {
             header.textContent = '专家 · 技能 · 连接器';
-            const [ex, sk, cn] = await Promise.all([
-                api('/api/experts'),
-                api('/api/skills'),
-                api('/api/connectors')
-            ]);
-            let html = '';
-            html += groupHtml('专家', ex.experts.map(e =>
-                `<div class="list-card"><h3>${escapeHtml(e.name)}</h3><p>${escapeHtml(e.description || '')}</p><span class="tag">${escapeHtml(String(e.mode))}</span></div>`
-            ));
-            html += groupHtml('技能', sk.skills.map(s =>
-                `<div class="list-card"><h3>${escapeHtml(s.name)}</h3><p>${escapeHtml(s.description || '')}</p></div>`
-            ));
-            html += groupHtml('连接器', (cn.connectors && cn.connectors.length)
-                ? cn.connectors.map(c => `<div class="list-card"><h3>${escapeHtml(c.name || 'MCP')}</h3></div>`)
-                : [emptyState('未配置连接器')]
-            );
+            let html = '<div class="settings-tabs" id="expertsTabs">';
+            EXPERTS_TABS.forEach(t => {
+                html += `<button class="settings-tab ${expertsTab === t.key ? 'active' : ''}" data-tab="${t.key}">${t.label}</button>`;
+            });
+            html += '</div><div id="expertsBody"><div class="empty-state">加载中…</div></div>';
             body.innerHTML = html;
-        } else if (key === 'automation') {
-            header.textContent = '自动化';
-            const { automations } = await api('/api/automations');
-            body.innerHTML = automations.length
-                ? automations.map(a => `<div class="list-card"><h3>${escapeHtml(a.name)}</h3></div>`).join('')
-                : emptyState('暂无自动化任务');
-        } else if (key === 'library') {
-            header.textContent = '资料库';
-            const { items } = await api('/api/library');
-            body.innerHTML = items.length
-                ? items.map(i => `<div class="list-card"><h3>${escapeHtml(i.name)}</h3></div>`).join('')
-                : emptyState('资料库为空');
-        } else if (key === 'more') {
-            header.textContent = '更多';
-            body.innerHTML = `<div class="list-card"><h3>关于 sdpost-claw</h3><p>开源全场景 AI 办公智能体桌面工作台。复刻 WorkBuddy 核心能力，本地优先、安全可控。</p></div>`;
-        } else if (key === 'apps') {
-            header.textContent = '应用 · 灵感';
-            body.innerHTML = emptyState('灵感中心即将上线 ✨');
+            body.querySelectorAll('.settings-tab').forEach(btn => {
+                btn.onclick = () => {
+                    expertsTab = btn.dataset.tab;
+                    renderList('experts');
+                };
+            });
+
+            const container = body.querySelector('#expertsBody');
+            if (expertsTab === 'experts') {
+                const { experts } = await api('/api/experts');
+                container.innerHTML = experts.length
+                    ? `<div class="list-grid">${experts.map(e =>
+                        `<div class="list-card"><h3>${escapeHtml(e.name)}</h3><p>${escapeHtml(e.description || '')}</p><span class="tag">${escapeHtml(String(e.mode))}</span></div>`).join('')}</div>`
+                    : emptyState('暂无专家');
+            } else if (expertsTab === 'skills') {
+                const { skills } = await api('/api/skills');
+                container.innerHTML = skills.length
+                    ? `<div class="list-grid">${skills.map(s =>
+                        `<div class="list-card"><h3>${escapeHtml(s.name)}</h3><p>${escapeHtml(s.description || '')}</p></div>`).join('')}</div>`
+                    : emptyState('暂无技能');
+            } else {
+                const cn = await api('/api/connectors');
+                const list = cn.connectors || [];
+                container.innerHTML = list.length
+                    ? `<div class="list-grid">${list.map(c =>
+                        `<div class="list-card"><h3>${escapeHtml(c.name || 'MCP')}</h3></div>`).join('')}</div>`
+                    : emptyState('未配置连接器');
+            }
         }
     } catch (e) {
         body.innerHTML = emptyState('加载失败：' + e.message);
     }
-}
-
-function groupHtml(title, cards) {
-    return `<h3 class="group-heading">${title}</h3><div class="list-grid">${cards.join('')}</div>`;
 }
 function emptyState(t) { return `<div class="empty-state">${escapeHtml(t)}</div>`; }
 
@@ -414,7 +722,8 @@ async function loadConfig() {
         state.availableModels = models;
         const sel = document.getElementById('modelSelect');
         sel.innerHTML = models.map(m => {
-            const label = m.name + ' (' + m.provider + ')';
+            let label = m.name + ' (' + m.provider + ')';
+            if (!m.api_key_set) label += ' · 未配置密钥';
             return `<option value="${escapeHtml(m.id)}" ${m.enabled ? '' : 'disabled'}>${escapeHtml(label)}</option>`;
         }).join('');
         // Select the current model from config
@@ -446,7 +755,21 @@ async function updateConfig(patch) {
         }
         if (patch.mode) state.config.mode = patch.mode;
     } catch (e) {
-        addTickerMessage('✗ 配置更新失败: ' + e.message);
+        if (patch.model_id) {
+            // Switch rejected (e.g. no API key) — reload the real active
+            // model so the dropdown reflects what chat actually uses.
+            addTickerMessage('✗ ' + e.message);
+            try {
+                const cfg = await api('/api/config');
+                if (cfg.model) state.config.model = cfg.model;
+                const sel = document.getElementById('modelSelect');
+                const idx = state.availableModels.findIndex(
+                    mm => mm.model === state.config.model || mm.id === state.config.model);
+                if (idx >= 0) sel.value = state.availableModels[idx].id;
+            } catch (_) {}
+        } else {
+            addTickerMessage('✗ 配置更新失败: ' + e.message);
+        }
     }
 }
 
@@ -456,7 +779,8 @@ async function refreshModelDropdown() {
         state.availableModels = models;
         const sel = document.getElementById('modelSelect');
         sel.innerHTML = models.map(m => {
-            const label = m.name + ' (' + m.provider + ')';
+            let label = m.name + ' (' + m.provider + ')';
+            if (!m.api_key_set) label += ' · 未配置密钥';
             return `<option value="${escapeHtml(m.id)}" ${m.enabled ? '' : 'disabled'}>${escapeHtml(label)}</option>`;
         }).join('');
         if (state.config.model) {
@@ -624,6 +948,7 @@ async function sendMessage() {
     const box = document.getElementById('inputBox');
     const text = box.value.trim();
     if (!text || state.isProcessing) return;
+    closeMention();
 
     state.isProcessing = true;
     box.value = '';
@@ -965,6 +1290,9 @@ function escapeHtml(s) {
 
 /* ---------- Settings (tabbed: general / models / context / skills / advanced) ---------- */
 let editingModelId = null;
+// True while the API key input still shows the untouched masked key —
+// saving/testing then keeps the stored key instead of overwriting it.
+let apiKeyPristine = false;
 let settingsTab = 'general';
 
 const SETTINGS_TABS = [
@@ -1158,7 +1486,7 @@ async function renderSettingsModels(container) {
                 </div>
                 <div class="provider-id">${escapeHtml(m.provider)} · ${escapeHtml(m.model)}</div>
                 <div class="provider-meta">
-                    <span>${m.api_key_set ? '✅ 已配置密钥' : '❌ 未配置密钥'}</span>
+                    <span>${m.api_key_set ? '🔑 ' + escapeHtml(m.api_key_masked || '****') : '❌ 未配置密钥'}</span>
                 </div>
                 <div class="provider-meta">${escapeHtml(m.base_url) || '—'}</div>
                 <div class="provider-actions">
@@ -1222,6 +1550,7 @@ function openModelModal(modelId) {
     const deleteBtn = document.getElementById('deleteModelBtn');
 
     // Reset form
+    apiKeyPristine = false;
     document.getElementById('editModelId').value = '';
     document.getElementById('editModelName').value = '';
     document.getElementById('editModelProvider').value = '';
@@ -1234,14 +1563,16 @@ function openModelModal(modelId) {
     if (modelId) {
         title.textContent = '编辑模型';
         deleteBtn.classList.remove('hidden');
-        document.getElementById('editModelId').readOnly = true;
+        document.getElementById('editModelId').readOnly = false;  // allow renaming
 
         api('/api/models/' + encodeURIComponent(modelId)).then(m => {
             document.getElementById('editModelId').value = m.id;
             document.getElementById('editModelName').value = m.name;
             document.getElementById('editModelProvider').value = m.provider || '';
             document.getElementById('editModelModel').value = m.model || '';
-            document.getElementById('editModelApiKey').value = '';
+            // Show the masked key in the box; editing it replaces the key.
+            document.getElementById('editModelApiKey').value = m.api_key_masked || '';
+            apiKeyPristine = m.api_key_set;
             document.getElementById('editModelBaseUrl').value = m.base_url || '';
         }).catch(() => {});
     } else {
@@ -1263,7 +1594,8 @@ async function saveModel() {
     const name = document.getElementById('editModelName').value.trim() || id;
     const provider = document.getElementById('editModelProvider').value.trim();
     const model = document.getElementById('editModelModel').value.trim();
-    const apiKey = document.getElementById('editModelApiKey').value.trim();
+    // Untouched masked key → send empty so the backend keeps the stored key.
+    const apiKey = apiKeyPristine ? '' : document.getElementById('editModelApiKey').value.trim();
     const baseUrl = document.getElementById('editModelBaseUrl').value.trim();
 
     if (!model) {
@@ -1279,11 +1611,14 @@ async function saveModel() {
     const url = isEdit ? '/api/models/' + encodeURIComponent(editingModelId) : '/api/models';
     const method = isEdit ? 'PUT' : 'POST';
 
+    const body = { id, name, provider, model, api_key: apiKey, base_url: baseUrl, enabled: true };
+    if (isEdit && id !== editingModelId) body.new_id = id;  // rename hint for backend
+
     try {
         await api(url, {
             method,
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ id, name, provider, model, api_key: apiKey, base_url: baseUrl, enabled: true }),
+            body: JSON.stringify(body),
         });
         addTickerMessage('✓ 模型已保存: ' + name);
         closeModelModal();
@@ -1297,7 +1632,8 @@ async function saveModel() {
 async function testModel() {
     const id = document.getElementById('editModelId').value.trim() || document.getElementById('editModelModel').value.trim();
     const model = document.getElementById('editModelModel').value.trim();
-    const apiKey = document.getElementById('editModelApiKey').value.trim();
+    // Untouched masked key → send empty; backend falls back to the saved key.
+    const apiKey = apiKeyPristine ? '' : document.getElementById('editModelApiKey').value.trim();
     const baseUrl = document.getElementById('editModelBaseUrl').value.trim();
 
     const result = document.getElementById('testResult');
