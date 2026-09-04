@@ -6,6 +6,7 @@ import asyncio
 import json
 import mimetypes
 import os
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -352,6 +353,30 @@ class DesktopServer:
         elif src is not None:
             src._skills = infos  # in-place refresh keeps the registry singleton
 
+    async def _resolve_invoked_skills(self, text: str) -> list:
+        """Match /<name> tokens in the user message against known skills.
+
+        Returns the full SkillInfo objects (with content) so their
+        instructions can be injected into the system context directly.
+        """
+        if not text:
+            return []
+        try:
+            skills = await self.skill_registry.list_all()
+        except Exception:
+            return []
+        matched: dict[str, Any] = {}
+        for skill in skills:
+            name = (skill.name or "").strip()
+            if not name:
+                continue
+            # "/<name>" not embedded in a larger path/token (handles both
+            # simple and spaced skill names, case-insensitively).
+            pattern = rf"(?<![\w/])/({re.escape(name)})(?![\w/-])"
+            if re.search(pattern, text, re.IGNORECASE):
+                matched.setdefault(name.lower(), skill)
+        return list(matched.values())
+
     async def _process_prompt(self, session: Session, text: str) -> None:
         """Process prompt through agent loop and stream events."""
         # Per-turn statistics (deepseek-harness style): tools / iterations / duration
@@ -413,6 +438,19 @@ class DesktopServer:
             "invoked skill's instructions to handle the rest of the "
             "message."
         )
+
+        # Server-side /<skill> resolution: inject the full instructions of
+        # each invoked skill into the system context so the model can apply
+        # them directly instead of hunting for skill files via tools.
+        try:
+            invoked_skills = await self._resolve_invoked_skills(text)
+        except Exception:
+            invoked_skills = []
+        if invoked_skills:
+            parts = ["\n\n## Invoked Skills"]
+            for skill in invoked_skills:
+                parts.append(f"\n### /{skill.name}\n{skill.content}")
+            system_context += "\n".join(parts)
 
         # Agent loop
         max_iterations = 20
